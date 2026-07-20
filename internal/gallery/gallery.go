@@ -986,6 +986,12 @@ const pageTemplate = `<!doctype html>
     .v-info .v-tags { display:flex; flex-wrap:wrap; gap:6px; margin-top:20px; }
     .v-info .v-tags span { background:#26262b; border-radius:999px; padding:4px 10px; font-size:.78rem; }
 
+    .toast { position:fixed; bottom:24px; left:50%; z-index:70; background:#1b1b1f; color:#fff;
+      border:1px solid var(--line); border-radius:10px; padding:10px 16px; font-size:.85rem;
+      box-shadow:0 12px 34px rgba(0,0,0,.5); opacity:0; pointer-events:none;
+      transform:translateX(-50%) translateY(20px); transition:opacity .18s ease, transform .18s ease; }
+    .toast.show { opacity:1; transform:translateX(-50%) translateY(0); }
+
     @media (max-width:600px) {
       .tile { height:200px; }
       .v-nav { width:40px; height:56px; font-size:1.5rem; }
@@ -993,7 +999,7 @@ const pageTemplate = `<!doctype html>
   </style>
 </head>
 <body>
-  <svg width="0" height="0" aria-hidden="true" style="position:absolute"><symbol id="ic-dl" viewBox="0 0 24 24"><path d="M12 3v11m0 0l-4-4m4 4l4-4M5 20h14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></symbol><symbol id="ic-info" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9" fill="none" stroke="currentColor" stroke-width="2"/><path d="M12 11v5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><circle cx="12" cy="7.6" r="1.15" fill="currentColor"/></symbol></svg>
+  <svg width="0" height="0" aria-hidden="true" style="position:absolute"><symbol id="ic-dl" viewBox="0 0 24 24"><path d="M12 3v11m0 0l-4-4m4 4l4-4M5 20h14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></symbol><symbol id="ic-info" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9" fill="none" stroke="currentColor" stroke-width="2"/><path d="M12 11v5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><circle cx="12" cy="7.6" r="1.15" fill="currentColor"/></symbol><symbol id="ic-link" viewBox="0 0 24 24"><path d="M9 15l6-6M10.5 6.5l1-1a4 4 0 015.9 5.9l-2 2M13.5 17.5l-1 1a4 4 0 01-5.9-5.9l2-2" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></symbol></svg>
 
   <header>
     <h1>Matt Blank</h1>
@@ -1021,6 +1027,7 @@ const pageTemplate = `<!doctype html>
     <div class="v-content">
       <div class="v-count" id="v-count"></div>
       <div class="v-bar">
+        <button class="v-btn" id="v-link" aria-label="Copy link to this photo"><svg class="ic" style="width:20px;height:20px"><use href="#ic-link"></use></svg></button>
         <button class="v-btn" id="v-info-btn" aria-label="Photo info"><svg class="ic" style="width:20px;height:20px"><use href="#ic-info"></use></svg></button>
         <button class="v-btn" id="v-dl" aria-label="Download"><svg class="ic" style="width:20px;height:20px"><use href="#ic-dl"></use></svg></button>
         <button class="v-btn" id="v-close" aria-label="Close">&times;</button>
@@ -1039,6 +1046,8 @@ const pageTemplate = `<!doctype html>
       </div>
     </aside>
   </div>
+
+  <div class="toast" id="toast"></div>
 
   <script>
   var PHOTOS = {{.PhotosJSON}};
@@ -1092,6 +1101,45 @@ const pageTemplate = `<!doctype html>
     }
 
     function dlURL(i, res){ return '/download/' + PHOTOS[i].p + '?res=' + encodeURIComponent(res); }
+
+    // Deep-linking: each open photo is reflected in the URL as ?photo=<path>, so
+    // links are shareable and the browser Back button closes the viewer.
+    var viewerPushed = false;
+    function rawPath(i){ return decodeURIComponent(PHOTOS[i].p); }
+    function findByPath(path){
+      for (var i = 0; i < PHOTOS.length; i++) { if (rawPath(i) === path) return i; }
+      return -1;
+    }
+    function urlWithPhoto(i){
+      var u = new URL(location.href);
+      u.searchParams.set('photo', rawPath(i));
+      return u.pathname + u.search;
+    }
+    function urlBase(){
+      var u = new URL(location.href);
+      u.searchParams.delete('photo');
+      return u.pathname + u.search;
+    }
+
+    var toastTimer;
+    function toast(msg){
+      var t = document.getElementById('toast');
+      t.textContent = msg;
+      t.classList.add('show');
+      clearTimeout(toastTimer);
+      toastTimer = setTimeout(function(){ t.classList.remove('show'); }, 1600);
+    }
+    function copyLink(text){
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(text).then(function(){ toast('Link copied'); }, function(){ toast('Copy failed'); });
+        return;
+      }
+      var ta = document.createElement('textarea');
+      ta.value = text; ta.style.position = 'fixed'; ta.style.opacity = '0';
+      document.body.appendChild(ta); ta.select();
+      try { document.execCommand('copy'); toast('Link copied'); } catch (_) { toast('Copy failed'); }
+      document.body.removeChild(ta);
+    }
 
     function el(tag, cls, text){
       var e = document.createElement(tag);
@@ -1157,11 +1205,28 @@ const pageTemplate = `<!doctype html>
       if (thumbs[i]) thumbs[i].scrollIntoView({ inline: 'center', block: 'nearest' });
       renderInfo(PHOTOS[i]);
       closeMenu();
+      if (!viewer.hidden) history.replaceState({ v: 1, i: i }, '', urlWithPhoto(i));
     }
-    function openViewer(i){ viewer.hidden = false; document.body.style.overflow = 'hidden'; go(i); }
-    function closeViewer(){ viewer.hidden = true; document.body.style.overflow = ''; vImg.src = ''; closeMenu(); }
+    function openViewer(i, viaHistory){
+      var wasClosed = viewer.hidden;
+      viewer.hidden = false; document.body.style.overflow = 'hidden';
+      if (wasClosed && !viaHistory) { history.pushState({ v: 1, i: i }, '', urlWithPhoto(i)); viewerPushed = true; }
+      go(i);
+    }
+    function closeViewer(viaHistory){
+      if (viewer.hidden) return;
+      viewer.hidden = true; document.body.style.overflow = ''; vImg.src = ''; closeMenu(); setInfo(false);
+      if (viaHistory) return;
+      if (viewerPushed) { viewerPushed = false; history.back(); }
+      else history.replaceState({ v: 0 }, '', urlBase());
+    }
     function next(){ if (cur < PHOTOS.length - 1) go(cur + 1); }
     function prev(){ if (cur > 0) go(cur - 1); }
+
+    addEventListener('popstate', function(e){
+      if (e.state && e.state.v === 1) openViewer(e.state.i, true);
+      else { viewerPushed = false; closeViewer(true); }
+    });
 
     if (grid) {
       grid.addEventListener('click', function(e){
@@ -1175,7 +1240,8 @@ const pageTemplate = `<!doctype html>
     function setInfo(open){ viewer.classList.toggle('info-open', open); infoBtn.classList.toggle('on', open); }
     function toggleInfo(){ setInfo(!viewer.classList.contains('info-open')); }
 
-    document.getElementById('v-close').onclick = closeViewer;
+    document.getElementById('v-close').onclick = function(e){ e.stopPropagation(); closeViewer(); };
+    document.getElementById('v-link').onclick = function(e){ e.stopPropagation(); copyLink(location.origin + urlWithPhoto(cur)); };
     infoBtn.onclick = function(e){ e.stopPropagation(); toggleInfo(); };
     document.getElementById('v-info-close').onclick = function(e){ e.stopPropagation(); setInfo(false); };
     document.getElementById('v-prev').onclick = function(e){ e.stopPropagation(); prev(); };
@@ -1205,6 +1271,18 @@ const pageTemplate = `<!doctype html>
       var dx = e.changedTouches[0].clientX - tx;
       if (Math.abs(dx) > 40) { if (dx < 0) next(); else prev(); }
     }, { passive: true });
+
+    // Open the viewer if the page was loaded with a ?photo= deep link.
+    var initPhoto = new URL(location.href).searchParams.get('photo');
+    if (initPhoto) {
+      var initIndex = findByPath(initPhoto);
+      if (initIndex >= 0) {
+        openViewer(initIndex, true);
+        history.replaceState({ v: 1, i: initIndex }, '', urlWithPhoto(initIndex));
+      } else {
+        history.replaceState({ v: 0 }, '', urlBase());
+      }
+    }
   })();
   </script>
 </body>
