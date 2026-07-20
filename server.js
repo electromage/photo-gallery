@@ -37,9 +37,6 @@ const limiter = rateLimit({
 });
 
 app.use(express.static(path.join(__dirname, 'public')));
-app.use('/api', limiter);
-app.use('/photos', limiter);
-app.use('/download', limiter);
 
 // Sanitize a user-supplied filename to just a plain filename (no path traversal).
 function safeFilename(raw) {
@@ -47,35 +44,38 @@ function safeFilename(raw) {
 }
 
 // GET /api/photos - list all photos
-app.get('/api/photos', (req, res) => {
-  fs.readdir(PHOTOS_DIR, (err, files) => {
-    if (err) {
-      return res.status(500).json({ error: 'Could not read photos directory' });
-    }
+app.get('/api/photos', limiter, async (req, res) => {
+  try {
+    const files = await fs.promises.readdir(PHOTOS_DIR);
     const photos = files
       .filter((f) => IMAGE_EXTENSIONS.has(path.extname(f).toLowerCase()))
       .map((f) => ({ name: f, url: `/photos/${encodeURIComponent(f)}` }));
     res.json(photos);
-  });
+  } catch (err) {
+    res.status(500).json({ error: 'Could not read photos directory' });
+  }
 });
 
 // GET /photos/:filename - serve original photo
-app.get('/photos/:filename', (req, res) => {
+app.get('/photos/:filename', limiter, (req, res) => {
   const filename = safeFilename(req.params.filename);
   const filepath = path.join(PHOTOS_DIR, filename);
-
-  if (!fs.existsSync(filepath)) {
-    return res.status(404).send('Photo not found');
-  }
 
   const ext = path.extname(filename).toLowerCase();
   const mimeType = MIME_TYPES[ext] || 'application/octet-stream';
   res.setHeader('Content-Type', mimeType);
-  fs.createReadStream(filepath).pipe(res);
+
+  const stream = fs.createReadStream(filepath);
+  stream.on('error', (err) => {
+    if (!res.headersSent) {
+      res.status(err.code === 'ENOENT' ? 404 : 500).send('Photo not found');
+    }
+  });
+  stream.pipe(res);
 });
 
 // GET /download/:filename?resolution=1080p - download photo at given resolution
-app.get('/download/:filename', (req, res) => {
+app.get('/download/:filename', limiter, (req, res) => {
   const filename = safeFilename(req.params.filename);
   const resolution = req.query.resolution || 'original';
   const filepath = path.join(PHOTOS_DIR, filename);
@@ -85,32 +85,38 @@ app.get('/download/:filename', (req, res) => {
     return res.status(400).send('Unsupported file type');
   }
 
-  if (!fs.existsSync(filepath)) {
-    return res.status(404).send('Photo not found');
-  }
-
   if (!Object.prototype.hasOwnProperty.call(RESOLUTIONS, resolution)) {
     return res.status(400).send('Unknown resolution. Valid options: ' + Object.keys(RESOLUTIONS).join(', '));
   }
 
   const base = path.basename(filename, ext);
   const downloadName = resolution === 'original' ? filename : `${base}-${resolution}.jpg`;
-
   res.setHeader('Content-Disposition', `attachment; filename="${downloadName}"`);
 
   if (resolution === 'original') {
     const mimeType = MIME_TYPES[ext] || 'application/octet-stream';
     res.setHeader('Content-Type', mimeType);
-    fs.createReadStream(filepath).pipe(res);
+    const stream = fs.createReadStream(filepath);
+    stream.on('error', (err) => {
+      if (!res.headersSent) {
+        res.status(err.code === 'ENOENT' ? 404 : 500).send('Photo not found');
+      }
+    });
+    stream.pipe(res);
     return;
   }
 
   const { width, height } = RESOLUTIONS[resolution];
   res.setHeader('Content-Type', 'image/jpeg');
-  sharp(filepath)
+  const resizer = sharp(filepath)
     .resize(width, height, { fit: 'inside', withoutEnlargement: true })
-    .toFormat('jpeg', { quality: 90 })
-    .pipe(res);
+    .toFormat('jpeg', { quality: 90 });
+  resizer.on('error', (err) => {
+    if (!res.headersSent) {
+      res.status(err.code === 'ENOENT' ? 404 : 500).send('Could not process photo');
+    }
+  });
+  resizer.pipe(res);
 });
 
 app.listen(PORT, () => {

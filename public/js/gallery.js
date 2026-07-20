@@ -20,7 +20,7 @@ let currentPhoto = null;
 async function loadPhotos() {
   try {
     const res = await fetch('/api/photos');
-    if (!res.ok) throw new Error('Failed to fetch photos');
+    if (!res.ok) throw new Error(`Failed to fetch photos: ${res.status} ${res.statusText}`);
     const photos = await res.json();
 
     gallery.innerHTML = '';
