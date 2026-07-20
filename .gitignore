@@ -1,1 +1,10 @@
-node_modules/
+# Compiled binary
+/photo-gallery
+
+# Persisted index cache
+/gallery-cache.gob
+/gallery-cache.gob.tmp
+
+# Local photo library (keep the directory, ignore its contents)
+/photos/*
+!/photos/.gitkeep

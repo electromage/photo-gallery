@@ -1,0 +1,40 @@
+[Unit]
+Description=Photo Gallery
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+# Point this at your photo library. Sub-directories become albums. The directory
+# must be readable by the service user (see the chmod step in the README).
+Environment=PHOTO_ROOT=/srv/photos
+Environment=ADDR=:8080
+Environment=GALLERY_CACHE=/var/lib/photo-gallery/index.gob
+# How often to pick up added/removed photos (Go duration, e.g. 30s, 5m; 0 disables).
+#Environment=GALLERY_REFRESH=2m
+
+ExecStart=/usr/local/bin/photo-gallery
+Restart=on-failure
+RestartSec=2
+
+# Run as an auto-provisioned, unprivileged user with a private state directory
+# at /var/lib/photo-gallery, where the index cache lives.
+DynamicUser=yes
+StateDirectory=photo-gallery
+
+# Hardening. If the service fails to start inside an *unprivileged* LXD container
+# with a namespace/mount error in `journalctl -u photo-gallery`, comment out this
+# block (an unprivileged container may not permit these).
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+
+[Install]
+WantedBy=multi-user.target

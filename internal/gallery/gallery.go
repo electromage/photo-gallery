@@ -3,17 +3,25 @@ package gallery
 import (
 	"bytes"
 	"encoding/binary"
+	"encoding/gob"
+	"encoding/json"
 	"fmt"
 	"html"
 	"html/template"
+	"image"
+	_ "image/jpeg" // register JPEG decoder for image.DecodeConfig
 	"io"
 	"io/fs"
+	"log"
+	"math"
 	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -34,11 +42,42 @@ var (
 )
 
 type Gallery struct {
-	root string
-	tmpl *template.Template
+	root      string
+	cachePath string // on-disk index cache; "" disables persistence
+	tmpl      *template.Template
 
 	mu    sync.RWMutex
 	state viewModel
+	ready bool                  // set once the first index completes
+	cache map[string]cacheEntry // key: MediaPath; lets rescans skip unchanged files
+
+	rescanMu sync.Mutex // serializes rescans so overlapping ticks are skipped
+}
+
+// cacheEntry remembers a processed photo along with the file stats used to decide
+// whether it can be reused on the next rescan without re-reading the file.
+type cacheEntry struct {
+	photo Photo
+	mod   int64
+	size  int64
+}
+
+// cacheVersion is bumped when the persisted format changes so stale files on disk
+// are ignored rather than misread.
+const cacheVersion = 1
+
+// persistedEntry / persistedFile are the on-disk (gob) form of the cache. They use
+// exported fields because gob only encodes those; Photo.searchText is unexported
+// and is recomputed on load.
+type persistedEntry struct {
+	Photo Photo
+	Mod   int64
+	Size  int64
+}
+
+type persistedFile struct {
+	Version int
+	Entries map[string]persistedEntry
 }
 
 type Album struct {
@@ -58,7 +97,16 @@ type Photo struct {
 	TakenAt    time.Time
 	TakenAtUTC string
 	Tags       []string
+	Width      int
+	Height     int
+	Info       []exifKV
 	searchText string
+}
+
+// exifKV is one labeled metadata field shown in the viewer (e.g. Camera → …).
+type exifKV struct {
+	Label string `json:"k"`
+	Value string `json:"v"`
 }
 
 type viewModel struct {
@@ -70,13 +118,30 @@ type viewModel struct {
 type pageData struct {
 	Albums       []Album
 	Photos       []Photo
+	PhotosJSON   template.JS
+	ResJSON      template.JS
 	Query        string
 	CurrentAlbum string
 	ActionURL    string
-	IndexedAt    string
 }
 
-func New(root string) (*Gallery, error) {
+// photoRef is the per-photo payload handed to the viewer's JavaScript: media URL,
+// escaped path (for building /download URLs), title, and metadata shown in the
+// viewer's info panel. The grid itself renders none of the metadata fields.
+type photoRef struct {
+	U     string   `json:"u"`
+	P     string   `json:"p"`
+	T     string   `json:"t"`
+	Album string   `json:"album,omitempty"`
+	Date  string   `json:"date,omitempty"`
+	Tags  []string `json:"tags,omitempty"`
+	Info  []exifKV `json:"info,omitempty"`
+}
+
+// New creates a gallery serving photos under root. If cachePath is non-empty, the
+// index is persisted there (gob) and reused on the next start so restarts skip
+// re-reading unchanged files. Cache problems never prevent the server from running.
+func New(root, cachePath string) (*Gallery, error) {
 	tmpl, err := template.New("gallery").Funcs(template.FuncMap{
 		"albumURL": func(path string) string {
 			if path == "" {
@@ -89,21 +154,243 @@ func New(root string) (*Gallery, error) {
 		return nil, err
 	}
 
-	g := &Gallery{root: root, tmpl: tmpl}
-	if err := g.Rescan(); err != nil {
+	// Validate the root synchronously so misconfiguration fails fast, then index
+	// in the background so the server can start listening immediately. Large
+	// libraries can take a while to index on first start; the page shows an
+	// "indexing" state until g.ready flips.
+	if info, err := os.Stat(root); err != nil {
 		return nil, err
+	} else if !info.IsDir() {
+		return nil, fmt.Errorf("%s is not a directory", root)
 	}
+
+	g := &Gallery{root: root, cachePath: cachePath, tmpl: tmpl, cache: map[string]cacheEntry{}}
+	if loaded := loadCache(cachePath); loaded != nil {
+		g.cache = loaded
+		log.Printf("loaded %d cached entries from %s", len(loaded), cachePath)
+	}
+	go func() {
+		if err := g.Rescan(); err != nil {
+			log.Printf("initial index failed: %v", err)
+		}
+	}()
 	return g, nil
 }
 
+// loadCache reads a persisted index. It returns nil (start cold) on any problem —
+// missing file, unreadable data, or a version mismatch — never an error.
+func loadCache(path string) map[string]cacheEntry {
+	if path == "" {
+		return nil
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return nil
+	}
+	defer file.Close()
+
+	var pf persistedFile
+	if err := gob.NewDecoder(file).Decode(&pf); err != nil {
+		log.Printf("ignoring unreadable cache %s: %v", path, err)
+		return nil
+	}
+	if pf.Version != cacheVersion {
+		return nil
+	}
+
+	out := make(map[string]cacheEntry, len(pf.Entries))
+	for key, entry := range pf.Entries {
+		photo := entry.Photo
+		photo.searchText = searchTextFor(photo)
+		out[key] = cacheEntry{photo: photo, mod: entry.Mod, size: entry.Size}
+	}
+	return out
+}
+
+// saveCache atomically writes the index to disk. All failures are logged and
+// swallowed; persistence is best-effort.
+func saveCache(path string, cache map[string]cacheEntry) {
+	if path == "" {
+		return
+	}
+	if dir := filepath.Dir(path); dir != "" && dir != "." {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			log.Printf("cache dir %s: %v", dir, err)
+			return
+		}
+	}
+
+	pf := persistedFile{Version: cacheVersion, Entries: make(map[string]persistedEntry, len(cache))}
+	for key, entry := range cache {
+		pf.Entries[key] = persistedEntry{Photo: entry.photo, Mod: entry.mod, Size: entry.size}
+	}
+
+	tmp := path + ".tmp"
+	file, err := os.Create(tmp)
+	if err != nil {
+		log.Printf("cache write %s: %v", tmp, err)
+		return
+	}
+	if err := gob.NewEncoder(file).Encode(pf); err != nil {
+		file.Close()
+		os.Remove(tmp)
+		log.Printf("cache encode: %v", err)
+		return
+	}
+	if err := file.Close(); err != nil {
+		os.Remove(tmp)
+		log.Printf("cache close: %v", err)
+		return
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		log.Printf("cache rename: %v", err)
+	}
+}
+
+// Rescan re-indexes the library. It walks the tree (a cheap stat-only pass),
+// reuses cached entries for files whose modtime and size are unchanged, and reads
+// metadata for new or changed files in parallel. Overlapping rescans are skipped.
 func (g *Gallery) Rescan() error {
-	state, err := buildViewModel(g.root)
+	if !g.rescanMu.TryLock() {
+		return nil // a rescan is already running
+	}
+	defer g.rescanMu.Unlock()
+
+	start := time.Now()
+	info, err := os.Stat(g.root)
 	if err != nil {
 		return err
 	}
+	if !info.IsDir() {
+		return fmt.Errorf("%s is not a directory", g.root)
+	}
+
+	type fileJob struct {
+		abs, rel, album string
+		mod             int64
+		size            int64
+	}
+
+	var jobs []fileJob
+	walkErr := filepath.WalkDir(g.root, func(path string, entry fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if entry.IsDir() || !jpgPattern.MatchString(entry.Name()) {
+			return nil
+		}
+		fi, err := entry.Info()
+		if err != nil {
+			return nil // skip files we cannot stat
+		}
+		rel, err := filepath.Rel(g.root, path)
+		if err != nil {
+			return err
+		}
+		rel = filepath.ToSlash(rel)
+		album := filepath.ToSlash(filepath.Dir(rel))
+		if album == "." {
+			album = ""
+		}
+		jobs = append(jobs, fileJob{abs: path, rel: rel, album: album, mod: fi.ModTime().UnixNano(), size: fi.Size()})
+		return nil
+	})
+	if walkErr != nil {
+		return walkErr
+	}
+
+	g.mu.RLock()
+	prev := g.cache
+	g.mu.RUnlock()
+
+	photos := make([]Photo, len(jobs))
+	newCache := make(map[string]cacheEntry, len(jobs))
+	var cacheMu sync.Mutex
+
+	var toProcess []int
+	for i, j := range jobs {
+		if entry, ok := prev[j.rel]; ok && entry.mod == j.mod && entry.size == j.size {
+			photos[i] = entry.photo
+			newCache[j.rel] = entry
+		} else {
+			toProcess = append(toProcess, i)
+		}
+	}
+
+	if len(toProcess) > 0 {
+		workers := runtime.NumCPU()
+		if workers > 8 {
+			workers = 8 // metadata reads are largely disk-bound
+		}
+		queue := make(chan int)
+		var wg sync.WaitGroup
+		for w := 0; w < workers; w++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for idx := range queue {
+					j := jobs[idx]
+					photo := buildPhoto(j.abs, j.rel, j.album, time.Unix(0, j.mod))
+					photos[idx] = photo
+					cacheMu.Lock()
+					newCache[j.rel] = cacheEntry{photo: photo, mod: j.mod, size: j.size}
+					cacheMu.Unlock()
+				}
+			}()
+		}
+		for _, idx := range toProcess {
+			queue <- idx
+		}
+		close(queue)
+		wg.Wait()
+	}
+
+	sort.Slice(photos, func(i, j int) bool {
+		if photos[i].TakenAt.Equal(photos[j].TakenAt) {
+			return photos[i].MediaPath < photos[j].MediaPath
+		}
+		return photos[i].TakenAt.After(photos[j].TakenAt)
+	})
+
+	albums := map[string]*Album{}
+	for _, p := range photos {
+		album := albums[p.AlbumPath]
+		if album == nil {
+			album = &Album{Path: p.AlbumPath, Name: p.AlbumName}
+			albums[p.AlbumPath] = album
+		}
+		album.Count++
+		if album.Cover == "" {
+			album.Cover = p.MediaPath
+		}
+	}
+	albumList := make([]Album, 0, len(albums))
+	for _, album := range albums {
+		albumList = append(albumList, *album)
+	}
+	sort.Slice(albumList, func(i, j int) bool {
+		if albumList[i].Path == "" {
+			return true
+		}
+		if albumList[j].Path == "" {
+			return false
+		}
+		return albumList[i].Name < albumList[j].Name
+	})
+
 	g.mu.Lock()
-	g.state = state
+	g.state = viewModel{Albums: albumList, Photos: photos, IndexedAt: time.Now()}
+	g.cache = newCache
+	g.ready = true
 	g.mu.Unlock()
+
+	log.Printf("indexed %d photos in %d albums (%d new/changed, %d reused) in %s",
+		len(photos), len(albumList), len(toProcess), len(jobs)-len(toProcess), time.Since(start).Round(time.Millisecond))
+
+	// Persist only when the index actually changed, so idle rescans don't rewrite.
+	if len(toProcess) > 0 || len(newCache) != len(prev) {
+		saveCache(g.cachePath, newCache)
+	}
 	return nil
 }
 
@@ -131,16 +418,27 @@ func (g *Gallery) HandleAlbum(w http.ResponseWriter, r *http.Request) {
 func (g *Gallery) render(w http.ResponseWriter, r *http.Request, currentAlbum string) {
 	g.mu.RLock()
 	state := g.state
+	ready := g.ready
 	g.mu.RUnlock()
 
+	if !ready {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.Header().Set("Retry-After", "3")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = io.WriteString(w, indexingPage)
+		return
+	}
+
 	query := strings.TrimSpace(r.URL.Query().Get("q"))
+	photos := filterPhotos(state.Photos, currentAlbum, query)
 	page := pageData{
 		Albums:       filterAlbums(state.Albums, currentAlbum),
-		Photos:       filterPhotos(state.Photos, currentAlbum, query),
+		Photos:       photos,
+		PhotosJSON:   photosPayload(photos),
+		ResJSON:      resPayload(),
 		Query:        query,
 		CurrentAlbum: currentAlbum,
 		ActionURL:    "/",
-		IndexedAt:    state.IndexedAt.Format("02 Jan 2006 15:04"),
 	}
 	if currentAlbum != "" {
 		page.ActionURL = "/albums/" + escapePath(currentAlbum)
@@ -152,97 +450,51 @@ func (g *Gallery) render(w http.ResponseWriter, r *http.Request, currentAlbum st
 	}
 }
 
-func buildViewModel(root string) (viewModel, error) {
-	info, err := os.Stat(root)
+// photosPayload serializes the visible photos as JSON for the viewer script.
+// json.Marshal escapes <, >, and & so the blob is safe to inline in <script>.
+func photosPayload(photos []Photo) template.JS {
+	refs := make([]photoRef, 0, len(photos))
+	for _, p := range photos {
+		refs = append(refs, photoRef{
+			U:     p.MediaURL,
+			P:     escapePath(p.MediaPath),
+			T:     p.Title,
+			Album: p.AlbumName,
+			Date:  p.TakenAtUTC,
+			Tags:  p.Tags,
+			Info:  p.Info,
+		})
+	}
+	data, err := json.Marshal(refs)
 	if err != nil {
-		return viewModel{}, err
+		return template.JS("[]")
 	}
-	if !info.IsDir() {
-		return viewModel{}, fmt.Errorf("%s is not a directory", root)
-	}
-
-	var photos []Photo
-	albums := map[string]*Album{}
-
-	err = filepath.WalkDir(root, func(path string, entry fs.DirEntry, walkErr error) error {
-		if walkErr != nil {
-			return walkErr
-		}
-		if entry.IsDir() {
-			return nil
-		}
-		if !jpgPattern.MatchString(entry.Name()) {
-			return nil
-		}
-
-		relPath, err := filepath.Rel(root, path)
-		if err != nil {
-			return err
-		}
-		relPath = filepath.ToSlash(relPath)
-		albumPath := filepath.ToSlash(filepath.Dir(relPath))
-		if albumPath == "." {
-			albumPath = ""
-		}
-
-		photo, err := buildPhoto(path, relPath, albumPath)
-		if err != nil {
-			return err
-		}
-		photos = append(photos, photo)
-
-		album := albums[albumPath]
-		if album == nil {
-			album = &Album{Path: albumPath, Name: prettyAlbumName(albumPath)}
-			albums[albumPath] = album
-		}
-		album.Count++
-		if album.Cover == "" {
-			album.Cover = photo.MediaPath
-		}
-		return nil
-	})
-	if err != nil {
-		return viewModel{}, err
-	}
-
-	sort.Slice(photos, func(i, j int) bool {
-		if photos[i].TakenAt.Equal(photos[j].TakenAt) {
-			return photos[i].MediaPath < photos[j].MediaPath
-		}
-		return photos[i].TakenAt.After(photos[j].TakenAt)
-	})
-
-	albumList := make([]Album, 0, len(albums))
-	for _, album := range albums {
-		albumList = append(albumList, *album)
-	}
-	sort.Slice(albumList, func(i, j int) bool {
-		if albumList[i].Path == "" {
-			return true
-		}
-		if albumList[j].Path == "" {
-			return false
-		}
-		return albumList[i].Name < albumList[j].Name
-	})
-
-	return viewModel{
-		Albums:    albumList,
-		Photos:    photos,
-		IndexedAt: time.Now(),
-	}, nil
+	return template.JS(data)
 }
 
-func buildPhoto(absPath, relPath, albumPath string) (Photo, error) {
-	fileInfo, err := os.Stat(absPath)
-	if err != nil {
-		return Photo{}, err
+// resPayload serializes the resolution labels offered in the download menu.
+func resPayload() template.JS {
+	labels := make([]string, 0, len(DownloadSizes))
+	for _, size := range DownloadSizes {
+		labels = append(labels, size.Label)
 	}
+	data, err := json.Marshal(labels)
+	if err != nil {
+		return template.JS("[]")
+	}
+	return template.JS(data)
+}
 
-	takenAt := fileInfo.ModTime()
+// buildPhoto reads a single photo's metadata and assembles its Photo. It is
+// best-effort: if metadata cannot be read, it falls back to the filename (title)
+// and the file's modification time (date). modTime is the stat already collected
+// during the walk, so no extra os.Stat is needed here.
+func buildPhoto(absPath, relPath, albumPath string, modTime time.Time) Photo {
+	takenAt := modTime
 	title := strings.TrimSuffix(filepath.Base(relPath), filepath.Ext(relPath))
 	tags := make([]string, 0, 4)
+	var width, height int
+	var info []exifKV
 
 	if metadata, err := readMetadata(absPath); err == nil {
 		if !metadata.takenAt.IsZero() {
@@ -252,6 +504,8 @@ func buildPhoto(absPath, relPath, albumPath string) (Photo, error) {
 			title = metadata.title
 		}
 		tags = append(tags, metadata.tags...)
+		width, height = metadata.width, metadata.height
+		info = metadata.info
 	}
 
 	tags = normalizeTerms(tags)
@@ -265,22 +519,41 @@ func buildPhoto(absPath, relPath, albumPath string) (Photo, error) {
 		TakenAt:    takenAt.UTC(),
 		TakenAtUTC: takenAt.UTC().Format("02 Jan 2006"),
 		Tags:       tags,
+		Width:      width,
+		Height:     height,
+		Info:       info,
 	}
-	photo.searchText = strings.ToLower(strings.Join([]string{
-		photo.Title,
-		photo.AlbumName,
-		photo.AlbumPath,
-		strings.Join(photo.Tags, " "),
-	}, " "))
+	photo.searchText = searchTextFor(photo)
 
-	return photo, nil
+	return photo
+}
+
+// searchTextFor builds the lowercased haystack used by search. It is also used to
+// rebuild the field for photos loaded from the cache, since gob does not persist
+// the unexported searchText.
+func searchTextFor(p Photo) string {
+	return strings.ToLower(strings.Join([]string{
+		p.Title,
+		p.AlbumName,
+		p.AlbumPath,
+		strings.Join(p.Tags, " "),
+	}, " "))
 }
 
 type metadata struct {
 	takenAt time.Time
 	title   string
 	tags    []string
+	width   int
+	height  int
+	info    []exifKV
 }
+
+// metadataPrefixBytes bounds how much of each file is read for metadata. EXIF
+// (capped at 64 KiB), XMP, and the JPEG dimension marker all live near the start,
+// so reading a prefix instead of the whole file avoids gigabytes of I/O on large
+// libraries of multi-megabyte photos. Files smaller than this are read in full.
+const metadataPrefixBytes = 512 << 10 // 512 KiB
 
 func readMetadata(path string) (metadata, error) {
 	file, err := os.Open(path)
@@ -289,12 +562,19 @@ func readMetadata(path string) (metadata, error) {
 	}
 	defer file.Close()
 
-	raw, err := io.ReadAll(file)
-	if err != nil {
+	raw := make([]byte, metadataPrefixBytes)
+	n, err := io.ReadFull(file, raw)
+	if err != nil && err != io.ErrUnexpectedEOF && err != io.EOF {
 		return metadata{}, err
 	}
+	raw = raw[:n]
 
 	result := metadata{}
+
+	if cfg, _, err := image.DecodeConfig(bytes.NewReader(raw)); err == nil {
+		result.width, result.height = cfg.Width, cfg.Height
+	}
+
 	if len(raw) > 0 {
 		xmpTags, xmpTitle := parseXMP(raw)
 		result.tags = append(result.tags, xmpTags...)
@@ -303,19 +583,122 @@ func readMetadata(path string) (metadata, error) {
 		}
 	}
 
-	exifData, err := exif.Decode(bytes.NewReader(raw))
-	if err != nil {
-		return result, nil
+	var exifData *exif.Exif
+	if data, err := exif.Decode(bytes.NewReader(raw)); err == nil {
+		exifData = data
+		if takenAt, err := data.DateTime(); err == nil {
+			result.takenAt = takenAt
+		}
+		if result.title == "" {
+			result.title = firstExifString(data, titleFields...)
+		}
+		result.tags = append(result.tags, collectExifTags(data)...)
 	}
 
-	if takenAt, err := exifData.DateTime(); err == nil {
-		result.takenAt = takenAt
-	}
-	if result.title == "" {
-		result.title = firstExifString(exifData, titleFields...)
-	}
-	result.tags = append(result.tags, collectExifTags(exifData)...)
+	result.info = buildInfo(exifData, result.width, result.height)
 	return result, nil
+}
+
+// buildInfo assembles the ordered EXIF fields shown in the viewer's info panel.
+// Missing fields are skipped. data may be nil (e.g. non-EXIF JPEG), in which case
+// only dimensions are reported.
+func buildInfo(data *exif.Exif, width, height int) []exifKV {
+	var info []exifKV
+	add := func(label, value string) {
+		if strings.TrimSpace(value) != "" {
+			info = append(info, exifKV{Label: label, Value: value})
+		}
+	}
+
+	if data != nil {
+		add("Camera", cameraName(exifString(data, "Make"), exifString(data, "Model")))
+		add("Lens", exifString(data, "LensModel"))
+		if fl := exifRat(data, "FocalLength"); fl > 0 {
+			add("Focal length", fmt.Sprintf("%g mm", round1(fl)))
+		}
+		if fn := exifRat(data, "FNumber"); fn > 0 {
+			add("Aperture", fmt.Sprintf("f/%g", round1(fn)))
+		}
+		if et := exifRat(data, "ExposureTime"); et > 0 {
+			add("Shutter", formatExposure(et))
+		}
+		add("ISO", exifInt(data, "ISOSpeedRatings"))
+	}
+	if width > 0 && height > 0 {
+		add("Dimensions", fmt.Sprintf("%d × %d", width, height))
+	}
+	return info
+}
+
+func exifString(data *exif.Exif, name string) string {
+	tag, err := data.Get(exif.FieldName(name))
+	if err != nil {
+		return ""
+	}
+	value, err := tag.StringVal()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(value)
+}
+
+func exifInt(data *exif.Exif, name string) string {
+	tag, err := data.Get(exif.FieldName(name))
+	if err != nil {
+		return ""
+	}
+	value, err := tag.Int(0)
+	if err != nil {
+		return ""
+	}
+	return strconv.Itoa(value)
+}
+
+func exifRat(data *exif.Exif, name string) float64 {
+	tag, err := data.Get(exif.FieldName(name))
+	if err != nil {
+		return 0
+	}
+	rat, err := tag.Rat(0)
+	if err != nil || rat == nil {
+		return 0
+	}
+	value, _ := rat.Float64()
+	return value
+}
+
+// cameraName combines make and model, avoiding duplication when the model already
+// carries the brand. Cameras commonly set a verbose make ("NIKON CORPORATION") and
+// a model that repeats the brand ("NIKON D750"), so matching on the make's first
+// word rather than the whole string collapses those to just the model.
+func cameraName(make, model string) string {
+	make = strings.TrimSpace(make)
+	model = strings.TrimSpace(model)
+	if model == "" {
+		return make
+	}
+	if make == "" {
+		return model
+	}
+	brand := strings.ToLower(strings.Fields(make)[0])
+	if strings.HasPrefix(strings.ToLower(model), brand) {
+		return model
+	}
+	return make + " " + model
+}
+
+func formatExposure(seconds float64) string {
+	if seconds <= 0 {
+		return ""
+	}
+	if seconds < 1 {
+		return fmt.Sprintf("1/%d s", int(math.Round(1/seconds)))
+	}
+	return fmt.Sprintf("%g s", round1(seconds))
+}
+
+func round1(f float64) float64 {
+	return math.Round(f*10) / 10
 }
 
 func collectExifTags(data *exif.Exif) []string {
@@ -488,102 +871,342 @@ func normalizeTerms(terms []string) []string {
 	return normalized
 }
 
+// indexingPage is served before the first index completes. It refreshes itself
+// until the gallery is ready.
+const indexingPage = `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta http-equiv="refresh" content="3">
+  <title>Matt Blank</title>
+  <style>
+    body { margin:0; min-height:100vh; display:grid; place-items:center; background:#0b0b0d; color:#ededf0;
+      font-family:Inter,system-ui,-apple-system,sans-serif; }
+    .box { text-align:center; padding:24px; }
+    .spin { width:34px; height:34px; margin:0 auto 20px; border:3px solid #26262b; border-top-color:#ededf0;
+      border-radius:50%; animation:spin 1s linear infinite; }
+    @keyframes spin { to { transform:rotate(360deg); } }
+    h1 { margin:0 0 8px; font-size:1.2rem; font-weight:600; }
+    p { margin:0; color:#8b8b92; font-size:.9rem; }
+  </style>
+</head>
+<body>
+  <div class="box">
+    <div class="spin"></div>
+    <h1>Indexing your library…</h1>
+    <p>This can take a moment on first start. The page refreshes automatically.</p>
+  </div>
+</body>
+</html>
+`
+
 const pageTemplate = `<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Photo Gallery</title>
+  <title>Matt Blank</title>
   <style>
-    :root { color-scheme: light; --bg:#f5f7fb; --panel:#ffffff; --text:#132238; --muted:#687487; --accent:#2563eb; --line:#d8e0ee; }
+    :root { color-scheme: dark; --bg:#0b0b0d; --fg:#ededf0; --muted:#8b8b92; --line:#242428; --panel:#161619; --hi:#f4f4f6; }
     * { box-sizing:border-box; }
-    body { margin:0; font-family:Inter,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; background:var(--bg); color:var(--text); }
+    html, body { margin:0; }
+    body { font-family:Inter,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; background:var(--bg); color:var(--fg); -webkit-font-smoothing:antialiased; }
     a { color:inherit; text-decoration:none; }
-    .shell { max-width:1280px; margin:0 auto; padding:32px 20px 48px; }
-    .hero { display:flex; flex-wrap:wrap; gap:16px; justify-content:space-between; align-items:end; margin-bottom:24px; }
-    .hero h1 { margin:0 0 8px; font-size:clamp(2rem,4vw,3rem); }
-    .hero p, .meta { margin:0; color:var(--muted); }
-    .search { display:flex; gap:12px; flex-wrap:wrap; }
-    .search input { min-width:260px; border:1px solid var(--line); background:var(--panel); border-radius:999px; padding:12px 16px; font:inherit; }
-    .search button { border:0; border-radius:999px; background:var(--accent); color:#fff; padding:12px 18px; font:inherit; cursor:pointer; }
-    .layout { display:grid; grid-template-columns:minmax(220px,260px) 1fr; gap:24px; }
-    .panel { background:var(--panel); border:1px solid var(--line); border-radius:24px; box-shadow:0 16px 40px rgba(15, 23, 42, 0.06); }
-    .albums { padding:20px; position:sticky; top:16px; }
-    .albums ul { list-style:none; margin:16px 0 0; padding:0; }
-    .albums li + li { margin-top:8px; }
-    .albums a { display:flex; justify-content:space-between; align-items:center; padding:10px 12px; border-radius:14px; color:var(--muted); }
-    .albums a.active, .albums a:hover { background:#eef4ff; color:var(--accent); }
-    .grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(260px,1fr)); gap:18px; }
-    .card { overflow:hidden; }
-    .card img { width:100%; aspect-ratio:4 / 3; object-fit:cover; display:block; background:#dfe6f4; }
-    .card-body { padding:16px; }
-    .card h2 { margin:0 0 6px; font-size:1.05rem; }
-    .card p { margin:0; color:var(--muted); }
-    .tags { display:flex; flex-wrap:wrap; gap:8px; margin-top:14px; }
-    .tag { background:#edf2ff; color:#3656a8; border-radius:999px; padding:6px 10px; font-size:.85rem; }
-    .empty { padding:40px; text-align:center; color:var(--muted); }
-    @media (max-width: 900px) { .layout { grid-template-columns:1fr; } .albums { position:static; } }
+    button { font:inherit; color:inherit; cursor:pointer; }
+
+    header { position:sticky; top:0; z-index:20; display:flex; align-items:center; gap:20px; flex-wrap:wrap;
+      padding:14px 18px; background:rgba(11,11,13,.82); backdrop-filter:blur(10px); border-bottom:1px solid var(--line); }
+    header h1 { margin:0; font-size:1.25rem; font-weight:600; letter-spacing:.01em; white-space:nowrap; }
+    .search { margin-left:auto; }
+    .search input { width:220px; max-width:46vw; border:1px solid var(--line); background:var(--panel); color:var(--fg);
+      border-radius:999px; padding:8px 14px; font:inherit; outline:none; }
+    .search input:focus { border-color:#3a3a42; }
+
+    .albums { display:flex; gap:8px; overflow-x:auto; padding:12px 18px; border-bottom:1px solid var(--line); scrollbar-width:thin; }
+    .chip { flex:0 0 auto; padding:6px 12px; border-radius:999px; border:1px solid var(--line); color:var(--muted);
+      font-size:.85rem; white-space:nowrap; transition:background .15s, color .15s; }
+    .chip:hover { color:var(--fg); }
+    .chip.active { background:var(--hi); color:#0b0b0d; border-color:var(--hi); }
+    .chip em { font-style:normal; opacity:.6; margin-left:6px; }
+
+    .grid { display:flex; flex-wrap:wrap; justify-content:center; gap:1px; padding:1px; align-content:flex-start; }
+    .tile { position:relative; overflow:hidden; background:var(--panel); cursor:zoom-in; height:320px; flex:0 0 auto; margin:0; }
+    .tile img { display:block; height:100%; width:auto; }
+    .grid.js .tile img { width:100%; object-fit:cover; }
+    .tile:hover img { filter:brightness(1.08); }
+    .tile-dl { position:absolute; top:8px; right:8px; width:34px; height:34px; display:grid; place-items:center;
+      border:0; border-radius:50%; background:rgba(0,0,0,.55); color:#fff; opacity:0; transform:translateY(-4px);
+      transition:opacity .15s, transform .15s; }
+    .tile:hover .tile-dl, .tile-dl:focus-visible { opacity:1; transform:none; }
+    .tile-dl:hover { background:rgba(0,0,0,.8); }
+    .ic { width:18px; height:18px; }
+
+    .empty { padding:80px 20px; text-align:center; color:var(--muted); }
+
+    .menu { position:fixed; display:none; z-index:60; min-width:132px; padding:6px; background:#1b1b1f;
+      border:1px solid var(--line); border-radius:12px; box-shadow:0 12px 34px rgba(0,0,0,.55); }
+    .menu a { display:block; padding:8px 12px; border-radius:8px; font-size:.88rem; color:var(--fg); }
+    .menu a:hover { background:#2a2a30; }
+
+    .viewer[hidden] { display:none; }
+    .viewer { position:fixed; inset:0; z-index:50; display:flex; background:rgba(6,6,8,.97); }
+    .v-content { flex:1; min-width:0; display:flex; flex-direction:column; position:relative; }
+    .v-stage { position:relative; flex:1; min-height:0; }
+    .v-stage img { position:absolute; inset:0; width:100%; height:100%; object-fit:contain; }
+    .v-bar { position:absolute; top:0; right:0; display:flex; gap:6px; padding:14px; z-index:4; }
+    .v-btn { width:42px; height:42px; display:grid; place-items:center; border:0; border-radius:50%;
+      background:rgba(255,255,255,.08); color:#fff; font-size:1.4rem; line-height:1; }
+    .v-btn:hover { background:rgba(255,255,255,.18); }
+    .v-btn.on { background:var(--hi); color:#0b0b0d; }
+    .v-nav { position:absolute; top:50%; transform:translateY(-50%); width:52px; height:72px; border:0; border-radius:12px;
+      background:rgba(255,255,255,.06); color:#fff; font-size:2rem; line-height:1; z-index:2; }
+    .v-nav:hover { background:rgba(255,255,255,.16); }
+    .v-prev { left:12px; } .v-next { right:12px; }
+    .v-count { position:absolute; top:22px; left:20px; color:var(--muted); font-size:.85rem; z-index:2; }
+
+    .filmstrip { flex:0 0 auto; display:flex; gap:6px; overflow-x:auto; padding:10px 12px; background:rgba(0,0,0,.35);
+      border-top:1px solid var(--line); scrollbar-width:thin; }
+    .fs-thumb { flex:0 0 auto; width:92px; height:60px; object-fit:cover; border-radius:6px; opacity:.5;
+      cursor:pointer; transition:opacity .15s; outline:2px solid transparent; }
+    .fs-thumb:hover { opacity:.85; }
+    .fs-thumb.active { opacity:1; outline-color:var(--hi); }
+
+    .v-info { flex:0 0 0; overflow:hidden; background:#121215; border-left:1px solid var(--line); transition:flex-basis .22s ease; }
+    .viewer.info-open .v-info { flex-basis:min(340px,82vw); }
+    .v-info-inner { position:relative; width:min(340px,82vw); height:100%; padding:22px; overflow-y:auto; box-sizing:border-box; }
+    .v-info-close { position:absolute; top:12px; right:14px; width:32px; height:32px; border:0; border-radius:50%;
+      background:rgba(255,255,255,.08); color:#fff; font-size:1.25rem; line-height:1; }
+    .v-info-close:hover { background:rgba(255,255,255,.18); }
+    .v-info h2 { margin:0 40px 4px 0; font-size:1.05rem; font-weight:600; word-break:break-word; }
+    .v-info .v-sub { margin:0 0 18px; color:var(--muted); font-size:.85rem; }
+    .v-info dl { display:grid; grid-template-columns:auto 1fr; gap:8px 14px; margin:0; font-size:.85rem; }
+    .v-info dt { color:var(--muted); white-space:nowrap; }
+    .v-info dd { margin:0; text-align:right; word-break:break-word; }
+    .v-info .v-tags { display:flex; flex-wrap:wrap; gap:6px; margin-top:20px; }
+    .v-info .v-tags span { background:#26262b; border-radius:999px; padding:4px 10px; font-size:.78rem; }
+
+    @media (max-width:600px) {
+      .tile { height:200px; }
+      .v-nav { width:40px; height:56px; font-size:1.5rem; }
+    }
   </style>
 </head>
 <body>
-  <div class="shell">
-    <div class="hero">
-      <div>
-        <p class="meta">Public, read-only photo archive</p>
-        <h1>Photo Gallery</h1>
-        <p>Newest JPEGs first, grouped by directory-backed albums, with search across album names and embedded tags.</p>
+  <svg width="0" height="0" aria-hidden="true" style="position:absolute"><symbol id="ic-dl" viewBox="0 0 24 24"><path d="M12 3v11m0 0l-4-4m4 4l4-4M5 20h14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></symbol><symbol id="ic-info" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9" fill="none" stroke="currentColor" stroke-width="2"/><path d="M12 11v5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><circle cx="12" cy="7.6" r="1.15" fill="currentColor"/></symbol></svg>
+
+  <header>
+    <h1>Matt Blank</h1>
+    <form class="search" method="get" action="{{.ActionURL}}">
+      <input type="search" name="q" placeholder="Search" value="{{.Query}}" aria-label="Search photos">
+    </form>
+  </header>
+
+  <nav class="albums">
+    <a class="chip {{if eq .CurrentAlbum ""}}active{{end}}" href="/">All</a>
+    {{range .Albums}}<a class="chip {{if .Active}}active{{end}}" href="{{albumURL .Path}}">{{.Name}}<em>{{.Count}}</em></a>{{end}}
+  </nav>
+
+  {{if .Photos}}
+  <main class="grid" id="grid">
+    {{range $i, $p := .Photos}}<figure class="tile" data-i="{{$i}}"{{if $p.Width}} data-w="{{$p.Width}}" data-h="{{$p.Height}}"{{end}}><img src="{{$p.MediaURL}}" alt="{{$p.Title}}" loading="lazy"{{if $p.Width}} width="{{$p.Width}}" height="{{$p.Height}}"{{end}}><button class="tile-dl" data-i="{{$i}}" aria-label="Download"><svg class="ic"><use href="#ic-dl"></use></svg></button></figure>{{end}}
+  </main>
+  {{else}}
+  <div class="empty">No photos in this album or search yet.</div>
+  {{end}}
+
+  <div class="menu" id="menu"></div>
+
+  <div class="viewer" id="viewer" hidden>
+    <div class="v-content">
+      <div class="v-count" id="v-count"></div>
+      <div class="v-bar">
+        <button class="v-btn" id="v-info-btn" aria-label="Photo info"><svg class="ic" style="width:20px;height:20px"><use href="#ic-info"></use></svg></button>
+        <button class="v-btn" id="v-dl" aria-label="Download"><svg class="ic" style="width:20px;height:20px"><use href="#ic-dl"></use></svg></button>
+        <button class="v-btn" id="v-close" aria-label="Close">&times;</button>
       </div>
-      <form class="search" method="get" action="{{.ActionURL}}">
-        <input type="search" name="q" placeholder="Search albums or tags" value="{{.Query}}">
-        <button type="submit">Search</button>
-      </form>
+      <div class="v-stage">
+        <button class="v-nav v-prev" id="v-prev" aria-label="Previous">&lsaquo;</button>
+        <img id="v-img" alt="">
+        <button class="v-nav v-next" id="v-next" aria-label="Next">&rsaquo;</button>
+      </div>
+      <div class="filmstrip" id="filmstrip"></div>
     </div>
-
-    <div class="layout">
-      <aside class="panel albums">
-        <p class="meta">Albums</p>
-        <ul>
-          <li><a href="/" class="{{if eq .CurrentAlbum ""}}active{{end}}"><span>All photos</span></a></li>
-          {{range .Albums}}
-          <li>
-            <a href="{{albumURL .Path}}" class="{{if .Active}}active{{end}}">
-              <span>{{.Name}}</span>
-              <span>{{.Count}}</span>
-            </a>
-          </li>
-          {{end}}
-        </ul>
-        <p class="meta" style="margin-top:18px;">Indexed {{.IndexedAt}}</p>
-      </aside>
-
-      <main>
-        {{if .Photos}}
-        <div class="grid">
-          {{range .Photos}}
-          <article class="panel card">
-            <a href="{{.MediaURL}}">
-              <img src="{{.MediaURL}}" alt="{{.Title}}" loading="lazy">
-            </a>
-            <div class="card-body">
-              <h2>{{.Title}}</h2>
-              <p>{{.AlbumName}} · {{.TakenAtUTC}}</p>
-              {{if .Tags}}
-              <div class="tags">
-                {{range .Tags}}<span class="tag">{{.}}</span>{{end}}
-              </div>
-              {{end}}
-            </div>
-          </article>
-          {{end}}
-        </div>
-        {{else}}
-        <div class="panel empty">
-          <p>No photos matched this album or search yet.</p>
-        </div>
-        {{end}}
-      </main>
-    </div>
+    <aside class="v-info" id="v-info">
+      <div class="v-info-inner">
+        <button class="v-info-close" id="v-info-close" aria-label="Close info">&times;</button>
+        <div id="v-info-body"></div>
+      </div>
+    </aside>
   </div>
+
+  <script>
+  var PHOTOS = {{.PhotosJSON}};
+  var RES = {{.ResJSON}};
+  (function(){
+    var grid = document.getElementById('grid');
+    var viewer = document.getElementById('viewer');
+    var vImg = document.getElementById('v-img');
+    var vCount = document.getElementById('v-count');
+    var strip = document.getElementById('filmstrip');
+    var menu = document.getElementById('menu');
+    var vInfo = document.getElementById('v-info-body');
+    var infoBtn = document.getElementById('v-info-btn');
+    var cur = -1;
+
+    // Justified rows: pack tiles left-to-right into rows scaled to a target height,
+    // so photos keep their native aspect ratio (no cropping) and time reads
+    // top-to-bottom, newest first.
+    function layoutGrid(){
+      if (!grid) return;
+      var gap = 1, target = 320;
+      var cs = getComputedStyle(grid);
+      var cw = grid.clientWidth - parseFloat(cs.paddingLeft) - parseFloat(cs.paddingRight);
+      if (cw <= 0) return;
+      var tiles = grid.children, row = [], sum = 0;
+      function aspect(t){ var w = +t.dataset.w, h = +t.dataset.h; return (w > 0 && h > 0) ? w / h : 1.5; }
+      function flush(last){
+        if (!row.length) return;
+        var avail = cw - gap * (row.length - 1);
+        var h = avail / sum;
+        if (last && h > target) h = target;
+        for (var k = 0; k < row.length; k++){
+          var t = row[k];
+          t.style.width = Math.floor(aspect(t) * h) + 'px';
+          t.style.height = Math.round(h) + 'px';
+        }
+        row = []; sum = 0;
+      }
+      for (var i = 0; i < tiles.length; i++){
+        var t = tiles[i];
+        row.push(t); sum += aspect(t);
+        if ((cw - gap * (row.length - 1)) / sum <= target) flush(false);
+      }
+      flush(true);
+    }
+    if (grid) {
+      grid.classList.add('js');
+      layoutGrid();
+      var rz;
+      addEventListener('resize', function(){ clearTimeout(rz); rz = setTimeout(layoutGrid, 120); });
+    }
+
+    function dlURL(i, res){ return '/download/' + PHOTOS[i].p + '?res=' + encodeURIComponent(res); }
+
+    function el(tag, cls, text){
+      var e = document.createElement(tag);
+      if (cls) e.className = cls;
+      if (text != null) e.textContent = text;
+      return e;
+    }
+
+    function renderInfo(p){
+      vInfo.innerHTML = '';
+      if (p.t) vInfo.appendChild(el('h2', null, p.t));
+      var sub = [p.album, p.date].filter(Boolean).join(' · ');
+      if (sub) vInfo.appendChild(el('p', 'v-sub', sub));
+      if (p.info && p.info.length) {
+        var dl = el('dl');
+        p.info.forEach(function(kv){ dl.appendChild(el('dt', null, kv.k)); dl.appendChild(el('dd', null, kv.v)); });
+        vInfo.appendChild(dl);
+      }
+      if (p.tags && p.tags.length) {
+        var tg = el('div', 'v-tags');
+        p.tags.forEach(function(t){ tg.appendChild(el('span', null, t)); });
+        vInfo.appendChild(tg);
+      }
+      if (!vInfo.childNodes.length) vInfo.appendChild(el('p', 'v-sub', 'No metadata available'));
+    }
+
+    function openMenu(i, x, y){
+      menu.innerHTML = '';
+      RES.concat(['original']).forEach(function(r){
+        var a = document.createElement('a');
+        a.href = dlURL(i, r);
+        a.setAttribute('download', '');
+        a.textContent = (r === 'original') ? 'Original' : r;
+        menu.appendChild(a);
+      });
+      menu.style.display = 'block';
+      var mw = menu.offsetWidth, mh = menu.offsetHeight;
+      if (x + mw > innerWidth - 8) x = innerWidth - mw - 8;
+      if (y + mh > innerHeight - 8) y = innerHeight - mh - 8;
+      menu.style.left = Math.max(8, x) + 'px';
+      menu.style.top = Math.max(8, y) + 'px';
+    }
+    function closeMenu(){ menu.style.display = 'none'; }
+
+    if (grid) {
+      PHOTOS.forEach(function(p, i){
+        var t = document.createElement('img');
+        t.src = p.u; t.loading = 'lazy'; t.className = 'fs-thumb'; t.dataset.i = i;
+        strip.appendChild(t);
+      });
+    }
+
+    function go(i){
+      if (i < 0) i = 0;
+      if (i >= PHOTOS.length) i = PHOTOS.length - 1;
+      cur = i;
+      vImg.src = PHOTOS[i].u;
+      vImg.alt = PHOTOS[i].t || '';
+      vCount.textContent = (i + 1) + ' / ' + PHOTOS.length;
+      [i - 1, i + 1].forEach(function(j){ if (j >= 0 && j < PHOTOS.length) { var im = new Image(); im.src = PHOTOS[j].u; } });
+      var thumbs = strip.children;
+      for (var k = 0; k < thumbs.length; k++) thumbs[k].classList.toggle('active', k === i);
+      if (thumbs[i]) thumbs[i].scrollIntoView({ inline: 'center', block: 'nearest' });
+      renderInfo(PHOTOS[i]);
+      closeMenu();
+    }
+    function openViewer(i){ viewer.hidden = false; document.body.style.overflow = 'hidden'; go(i); }
+    function closeViewer(){ viewer.hidden = true; document.body.style.overflow = ''; vImg.src = ''; closeMenu(); }
+    function next(){ if (cur < PHOTOS.length - 1) go(cur + 1); }
+    function prev(){ if (cur > 0) go(cur - 1); }
+
+    if (grid) {
+      grid.addEventListener('click', function(e){
+        var dl = e.target.closest('.tile-dl');
+        if (dl) { e.preventDefault(); e.stopPropagation(); var r = dl.getBoundingClientRect(); openMenu(+dl.dataset.i, r.right - 132, r.bottom + 6); return; }
+        var tile = e.target.closest('.tile');
+        if (tile) openViewer(+tile.dataset.i);
+      });
+    }
+
+    function setInfo(open){ viewer.classList.toggle('info-open', open); infoBtn.classList.toggle('on', open); }
+    function toggleInfo(){ setInfo(!viewer.classList.contains('info-open')); }
+
+    document.getElementById('v-close').onclick = closeViewer;
+    infoBtn.onclick = function(e){ e.stopPropagation(); toggleInfo(); };
+    document.getElementById('v-info-close').onclick = function(e){ e.stopPropagation(); setInfo(false); };
+    document.getElementById('v-prev').onclick = function(e){ e.stopPropagation(); prev(); };
+    document.getElementById('v-next').onclick = function(e){ e.stopPropagation(); next(); };
+    document.getElementById('v-dl').onclick = function(e){ e.stopPropagation(); var r = this.getBoundingClientRect(); openMenu(cur, r.right - 132, r.bottom + 6); };
+    strip.addEventListener('click', function(e){ var t = e.target.closest('.fs-thumb'); if (t) go(+t.dataset.i); });
+
+    document.addEventListener('click', function(e){
+      if (!menu.contains(e.target) && !e.target.closest('.tile-dl') && !e.target.closest('#v-dl')) closeMenu();
+    });
+    menu.addEventListener('click', function(){ setTimeout(closeMenu, 0); });
+
+    document.addEventListener('keydown', function(e){
+      if (viewer.hidden) return;
+      if (e.key === 'ArrowLeft') prev();
+      else if (e.key === 'ArrowRight') next();
+      else if (e.key === 'Escape') { if (viewer.classList.contains('info-open')) setInfo(false); else closeViewer(); }
+      else if (e.key === 'Home') go(0);
+      else if (e.key === 'End') go(PHOTOS.length - 1);
+      else if (e.key === 'i' || e.key === 'I') toggleInfo();
+    });
+
+    var stage = document.querySelector('.v-stage');
+    var tx = 0;
+    stage.addEventListener('touchstart', function(e){ tx = e.changedTouches[0].clientX; }, { passive: true });
+    stage.addEventListener('touchend', function(e){
+      var dx = e.changedTouches[0].clientX - tx;
+      if (Math.abs(dx) > 40) { if (dx < 0) next(); else prev(); }
+    }, { passive: true });
+  })();
+  </script>
 </body>
 </html>
 `
