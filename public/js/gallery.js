@@ -78,7 +78,7 @@ function openLightbox(photo) {
   RESOLUTIONS.forEach(({ key, label, dims }) => {
     const a = document.createElement('a');
     a.className = 'download-btn';
-    a.href = `/download/${encodeURIComponent(photo.name)}?resolution=${key}`;
+    a.href = `/download/${encodeURIComponent(photo.name)}?resolution=${encodeURIComponent(key)}`;
     a.download = '';
     a.setAttribute('aria-label', `Download ${photo.name} at ${label} (${dims})`);
 

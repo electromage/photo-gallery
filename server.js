@@ -57,11 +57,21 @@ app.get('/api/photos', limiter, async (req, res) => {
 });
 
 // GET /photos/:filename - serve original photo
-app.get('/photos/:filename', limiter, (req, res) => {
+app.get('/photos/:filename', limiter, async (req, res) => {
   const filename = safeFilename(req.params.filename);
-  const filepath = path.join(PHOTOS_DIR, filename);
-
   const ext = path.extname(filename).toLowerCase();
+
+  if (!IMAGE_EXTENSIONS.has(ext)) {
+    return res.status(400).send('Unsupported file type');
+  }
+
+  const filepath = path.join(PHOTOS_DIR, filename);
+  try {
+    await fs.promises.access(filepath, fs.constants.R_OK);
+  } catch {
+    return res.status(404).send('Photo not found');
+  }
+
   const mimeType = MIME_TYPES[ext] || 'application/octet-stream';
   res.setHeader('Content-Type', mimeType);
 
@@ -75,7 +85,7 @@ app.get('/photos/:filename', limiter, (req, res) => {
 });
 
 // GET /download/:filename?resolution=1080p - download photo at given resolution
-app.get('/download/:filename', limiter, (req, res) => {
+app.get('/download/:filename', limiter, async (req, res) => {
   const filename = safeFilename(req.params.filename);
   const resolution = req.query.resolution || 'original';
   const filepath = path.join(PHOTOS_DIR, filename);
@@ -87,6 +97,12 @@ app.get('/download/:filename', limiter, (req, res) => {
 
   if (!Object.prototype.hasOwnProperty.call(RESOLUTIONS, resolution)) {
     return res.status(400).send('Unknown resolution. Valid options: ' + Object.keys(RESOLUTIONS).join(', '));
+  }
+
+  try {
+    await fs.promises.access(filepath, fs.constants.R_OK);
+  } catch {
+    return res.status(404).send('Photo not found');
   }
 
   const base = path.basename(filename, ext);
