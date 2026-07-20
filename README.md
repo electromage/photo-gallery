@@ -1,35 +1,37 @@
 # photo-gallery
+Simple Web Photo Gallery
 
-Simple public web photo gallery in Go.
+A lightweight Node.js photo gallery that lets visitors browse photos and download them in a variety of resolutions perfect for desktop backgrounds.
 
 ## Features
 
-- scans a photo directory and turns folders into albums
-- serves JPEGs without authentication
-- sorts photos newest-first using EXIF capture time, with file time as a fallback
-- searches album names and embedded XMP/EXIF tag metadata
-- ships with a small Docker image that fits behind Caddy or another reverse proxy
+- Grid gallery of all photos in the `photos/` directory
+- Lightbox viewer with keyboard and click-to-close support
+- One-click download in multiple resolutions:
+  - **720p** — 1280 × 720
+  - **1080p** — 1920 × 1080
+  - **1440p** — 2560 × 1440
+  - **4K** — 3840 × 2160
+  - **Original** — full-size unmodified file
 
-## Run locally
+Images are resized on the fly using [Sharp](https://sharp.pixelplumbing.com/), scaled down proportionally (never upscaled).
 
-```bash
-mkdir -p ./photos
-PHOTO_ROOT=./photos go run .
-```
-
-Then open http://localhost:8080.
-
-## Docker
+## Getting started
 
 ```bash
-docker build -t photo-gallery .
-docker run --rm -p 8080:8080 -v "$PWD/photos:/photos:ro" photo-gallery
+npm install
 ```
 
-## Reverse proxy with Caddy
+Add your photos (JPEG, PNG, WebP, GIF, TIFF) to the `photos/` directory, then start the server:
 
-```caddyfile
-gallery.example.com {
-	reverse_proxy 127.0.0.1:8080
-}
+```bash
+npm start
 ```
+
+Open <http://localhost:3000> in your browser.
+
+## Configuration
+
+| Environment variable | Default | Description |
+|---|---|---|
+| `PORT` | `3000` | Port the server listens on |

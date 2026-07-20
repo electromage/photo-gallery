@@ -1,0 +1,23 @@
+{
+  "name": "photo-gallery",
+  "version": "1.0.0",
+  "description": "Simple Web Photo Gallery",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "http://localhost:26831/electromage/photo-gallery.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "express": "^5.2.1",
+    "express-rate-limit": "^8.6.0",
+    "sharp": "^0.35.3"
+  }
+}
