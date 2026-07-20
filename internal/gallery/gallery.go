@@ -17,6 +17,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 	"unicode/utf16"
 
 	"github.com/rwcarlsen/goexif/exif"
@@ -434,7 +435,7 @@ func prettyAlbumName(albumPath string) string {
 	base := filepath.Base(albumPath)
 	base = strings.ReplaceAll(base, "-", " ")
 	base = strings.ReplaceAll(base, "_", " ")
-	return strings.Title(base)
+	return titleWords(base)
 }
 
 func escapePath(path string) string {
@@ -443,6 +444,19 @@ func escapePath(path string) string {
 		parts[i] = url.PathEscape(part)
 	}
 	return strings.Join(parts, "/")
+}
+
+func titleWords(input string) string {
+	words := strings.Fields(strings.ToLower(strings.TrimSpace(input)))
+	for i, word := range words {
+		runes := []rune(word)
+		if len(runes) == 0 {
+			continue
+		}
+		runes[0] = unicode.ToUpper(runes[0])
+		words[i] = string(runes)
+	}
+	return strings.Join(words, " ")
 }
 
 func splitTerms(input string) []string {
