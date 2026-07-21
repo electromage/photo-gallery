@@ -3,10 +3,15 @@
 A simple, self-hostable web photo gallery — point it at a directory of photos and
 it builds a public, browsable archive. Meant as an easy way to get off Flickr.
 
-- **Scrapes directories automatically** — each sub-folder of your photo root becomes
-  an album. Drop in files and they show up; no database, no upload step, no admin UI.
-- **Public feed** — the main page shows every photo, newest first, no login required.
-- **Albums sidebar** — browse by directory-backed album.
+- **Scrapes directories automatically** — every folder (and sub-folder) of your photo
+  root becomes an album. Drop in files and they show up; no database, no upload step.
+- **Public feed** — the main page shows every photo, newest first, no login required,
+  with month/year section breaks.
+- **Folder tree** — a collapsible **Folders** dropdown mirrors your directory
+  structure; selecting a folder shows it and everything beneath it.
+- **Keyword browsing & filtering** — a **Keywords** dropdown lists every EXIF/XMP
+  keyword (most-used first, with a filter box); click one — or a keyword on a photo —
+  to show just those photos (`?tag=…`). Folder + keyword + text search combine.
 - **Search** — filter by album name, embedded EXIF/XMP title, and tags/keywords.
 - **Multi-resolution downloads** — grab any photo at 720p, 1080p, 1440p, 4K, or the
   full-size original — handy for desktop backgrounds. Images are scaled down
@@ -189,8 +194,8 @@ layer. Point elsewhere with `GALLERY_ENV_FILE=/path/to/file`.
 
 | Route | Description |
 |---|---|
-| `GET /` | Main feed (all photos, newest first). `?q=` filters by album/title/tags. |
-| `GET /albums/{album}` | A single album's photos. `?q=` filters within it. |
+| `GET /` | Main feed (all photos, newest first). `?q=` full-text filter, `?tag=` exact-keyword filter. |
+| `GET /albums/{album}` | An album and its sub-albums. Combines with `?q=` and `?tag=`. |
 | `GET /media/{path}` | Serves the original image file. |
 | `GET /thumb/{path}` | Small cached JPEG thumbnail (used by the grid/filmstrip). |
 | `GET /preview/{path}` | Medium cached JPEG (≤2048px) shown in the viewer instead of the original. |
