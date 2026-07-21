@@ -16,9 +16,10 @@ EXPOSE 8080
 
 ENV ADDR=:8080
 ENV PHOTO_ROOT=/photos
-# Persist the index cache here. Mount a writable volume at /cache to make it
-# survive container recreation; otherwise it lives in the container's ephemeral
-# layer and each fresh container re-indexes from scratch.
+# Persist the index cache and generated thumbnails here. Mount a writable volume
+# at /cache to make them survive container recreation; otherwise they live in the
+# container's ephemeral layer and are regenerated for each fresh container.
 ENV GALLERY_CACHE=/cache/index.gob
+ENV THUMB_CACHE=/cache/thumbs
 
 CMD ["/app/photo-gallery"]

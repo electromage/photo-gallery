@@ -5,6 +5,9 @@
 /gallery-cache.gob
 /gallery-cache.gob.tmp
 
+# Generated thumbnail cache
+/gallery-thumbs/
+
 # Local environment config
 /.env
 

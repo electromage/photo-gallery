@@ -9,6 +9,7 @@ Wants=network-online.target
 Environment=PHOTO_ROOT=/srv/photos
 Environment=ADDR=:8080
 Environment=GALLERY_CACHE=/var/lib/photo-gallery/index.gob
+Environment=THUMB_CACHE=/var/lib/photo-gallery/thumbs
 Environment=SITE_TITLE=My Photo Gallery
 # Public URL; enables shareable link previews (Open Graph). Leave unset if none.
 #Environment=SITE_DOMAIN=https://photos.example.com
