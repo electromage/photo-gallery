@@ -121,6 +121,11 @@ Designed to handle large libraries (tens of thousands of photos):
   problems are always non-fatal — the server falls back to a cold index. In Docker,
   mount a writable volume at `/cache` (the default `GALLERY_CACHE` path) to keep it
   across container recreation.
+- **Real thumbnails.** The browsing grid and filmstrip are served small JPEG
+  thumbnails from `/thumb/...` — not the full-size originals — so a page of a large
+  library loads a few MB instead of hundreds. Each thumbnail is generated once
+  (respecting EXIF orientation) and cached on disk under `THUMB_CACHE`; the full-res
+  original is only fetched when you open a photo in the viewer.
 
 Each index pass logs a one-line summary, e.g.
 `indexed 16000 photos in 42 albums (120 new/changed, 15880 reused) in 180ms`.
@@ -140,6 +145,7 @@ layer. Point elsewhere with `GALLERY_ENV_FILE=/path/to/file`.
 | `ADDR` | `:8080` | Address/port to listen on |
 | `GALLERY_REFRESH` | `2m` | How often to rescan for changes (Go duration, e.g. `30s`, `5m`; `0` disables) |
 | `GALLERY_CACHE` | `gallery-cache.gob` | Path to the persisted index cache (`/cache/index.gob` in the Docker image). Set empty to disable persistence |
+| `THUMB_CACHE` | `gallery-thumbs` | Directory for generated thumbnails (`/cache/thumbs` in the Docker image). Set empty to generate them on the fly without caching |
 | `GALLERY_ENV_FILE` | `.env` | Path to the env file to load at startup |
 
 ## Endpoints
@@ -148,6 +154,7 @@ layer. Point elsewhere with `GALLERY_ENV_FILE=/path/to/file`.
 |---|---|
 | `GET /` | Main feed (all photos, newest first). `?q=` filters by album/title/tags. |
 | `GET /albums/{album}` | A single album's photos. `?q=` filters within it. |
-| `GET /media/{path}` | Serves the original image file. |
+| `GET /media/{path}` | Serves the original image file (used by the viewer). |
+| `GET /thumb/{path}` | Serves a small cached JPEG thumbnail (used by the grid/filmstrip). |
 | `GET /download/{path}?res=1080p` | Download resized to `720p`, `1080p`, `1440p`, `4k`, or `original`. |
 | `GET /healthz` | Health check; returns `ok`. |

@@ -19,13 +19,15 @@ func main() {
 	photoRoot := getenv("PHOTO_ROOT", "./photos")
 	addr := getenv("ADDR", ":8080")
 	cachePath := getenv("GALLERY_CACHE", "gallery-cache.gob")
+	thumbCache := getenv("THUMB_CACHE", "gallery-thumbs")
 	refreshInterval := durationEnv("GALLERY_REFRESH", 2*time.Minute)
 
 	app, err := gallery.New(gallery.Config{
-		PhotoRoot: photoRoot,
-		CachePath: cachePath,
-		Title:     getenv("SITE_TITLE", "Photo Gallery"),
-		Domain:    getenv("SITE_DOMAIN", ""),
+		PhotoRoot:  photoRoot,
+		CachePath:  cachePath,
+		ThumbCache: thumbCache,
+		Title:      getenv("SITE_TITLE", "Photo Gallery"),
+		Domain:     getenv("SITE_DOMAIN", ""),
 	})
 	if err != nil {
 		log.Fatalf("unable to index photos: %v", err)
@@ -45,6 +47,7 @@ func main() {
 
 	mux := http.NewServeMux()
 	mux.Handle("/media/", http.StripPrefix("/media/", http.FileServer(http.FS(os.DirFS(photoRoot)))))
+	mux.HandleFunc("/thumb/", app.HandleThumb)
 	mux.HandleFunc("/download/", app.HandleDownload)
 	mux.HandleFunc("/albums/", app.HandleAlbum)
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {

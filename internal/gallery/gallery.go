@@ -44,15 +44,17 @@ var (
 // Config holds the gallery's settings. Add fields here as configuration grows;
 // main wires each one from an environment variable (optionally via a .env file).
 type Config struct {
-	PhotoRoot string // directory to index and serve
-	CachePath string // on-disk index cache; "" disables persistence
-	Title     string // site title (page <title> and header); defaults to "Photo Gallery"
-	Domain    string // public base URL, e.g. https://photos.example.com; enables canonical/OG tags
+	PhotoRoot  string // directory to index and serve
+	CachePath  string // on-disk index cache; "" disables persistence
+	ThumbCache string // directory for generated thumbnails; "" generates on the fly (no caching)
+	Title      string // site title (page <title> and header); defaults to "Photo Gallery"
+	Domain     string // public base URL, e.g. https://photos.example.com; enables canonical/OG tags
 }
 
 type Gallery struct {
 	root      string
 	cachePath string // on-disk index cache; "" disables persistence
+	thumbDir  string // thumbnail cache directory; "" disables caching
 	title     string
 	domain    string
 	tmpl      *template.Template
@@ -145,8 +147,9 @@ type pageData struct {
 // escaped path (for building /download URLs), title, and metadata shown in the
 // viewer's info panel. The grid itself renders none of the metadata fields.
 type photoRef struct {
-	U     string   `json:"u"`
-	P     string   `json:"p"`
+	U     string   `json:"u"`  // full-size media URL (viewer)
+	Th    string   `json:"th"` // thumbnail URL (filmstrip)
+	P     string   `json:"p"`  // escaped path (for /download URLs)
 	T     string   `json:"t"`
 	Album string   `json:"album,omitempty"`
 	Date  string   `json:"date,omitempty"`
@@ -164,6 +167,9 @@ func New(cfg Config) (*Gallery, error) {
 				return "/"
 			}
 			return "/albums/" + escapePath(path)
+		},
+		"thumbURL": func(mediaPath string) string {
+			return "/thumb/" + escapePath(mediaPath)
 		},
 	}).Parse(pageTemplate)
 	if err != nil {
@@ -194,6 +200,7 @@ func New(cfg Config) (*Gallery, error) {
 	g := &Gallery{
 		root:      root,
 		cachePath: cfg.CachePath,
+		thumbDir:  strings.TrimSpace(cfg.ThumbCache),
 		title:     title,
 		domain:    strings.TrimRight(strings.TrimSpace(cfg.Domain), "/"),
 		tmpl:      tmpl,
@@ -511,6 +518,7 @@ func photosPayload(photos []Photo) template.JS {
 	for _, p := range photos {
 		refs = append(refs, photoRef{
 			U:     p.MediaURL,
+			Th:    "/thumb/" + escapePath(p.MediaPath),
 			P:     escapePath(p.MediaPath),
 			T:     p.Title,
 			Album: p.AlbumName,
@@ -1076,7 +1084,7 @@ const pageTemplate = `<!doctype html>
 
   {{if .Photos}}
   <main class="grid" id="grid">
-    {{range $i, $p := .Photos}}<figure class="tile" data-i="{{$i}}"{{if $p.Width}} data-w="{{$p.Width}}" data-h="{{$p.Height}}"{{end}}><img src="{{$p.MediaURL}}" alt="{{$p.Title}}" loading="lazy"{{if $p.Width}} width="{{$p.Width}}" height="{{$p.Height}}"{{end}}><button class="tile-dl" data-i="{{$i}}" aria-label="Download"><svg class="ic"><use href="#ic-dl"></use></svg></button></figure>{{end}}
+    {{range $i, $p := .Photos}}<figure class="tile" data-i="{{$i}}"{{if $p.Width}} data-w="{{$p.Width}}" data-h="{{$p.Height}}"{{end}}><img src="{{thumbURL $p.MediaPath}}" alt="{{$p.Title}}" loading="lazy" decoding="async"{{if $p.Width}} width="{{$p.Width}}" height="{{$p.Height}}"{{end}}><button class="tile-dl" data-i="{{$i}}" aria-label="Download"><svg class="ic"><use href="#ic-dl"></use></svg></button></figure>{{end}}
   </main>
   {{else}}
   <div class="empty">No photos in this album or search yet.</div>
@@ -1248,7 +1256,7 @@ const pageTemplate = `<!doctype html>
     if (grid) {
       PHOTOS.forEach(function(p, i){
         var t = document.createElement('img');
-        t.src = p.u; t.loading = 'lazy'; t.className = 'fs-thumb'; t.dataset.i = i;
+        t.src = p.th; t.loading = 'lazy'; t.className = 'fs-thumb'; t.dataset.i = i;
         strip.appendChild(t);
       });
     }
