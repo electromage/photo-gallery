@@ -1,21 +1,32 @@
 package main
 
 import (
+	"bufio"
 	"log"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/electromage/photo-gallery/internal/gallery"
 )
 
 func main() {
+	// Load a .env file (if present) before reading configuration. Real environment
+	// variables always win over .env, so container/systemd settings override it.
+	loadDotEnv(getenv("GALLERY_ENV_FILE", ".env"))
+
 	photoRoot := getenv("PHOTO_ROOT", "./photos")
 	addr := getenv("ADDR", ":8080")
 	cachePath := getenv("GALLERY_CACHE", "gallery-cache.gob")
 	refreshInterval := durationEnv("GALLERY_REFRESH", 2*time.Minute)
 
-	app, err := gallery.New(photoRoot, cachePath)
+	app, err := gallery.New(gallery.Config{
+		PhotoRoot: photoRoot,
+		CachePath: cachePath,
+		Title:     getenv("SITE_TITLE", "Photo Gallery"),
+		Domain:    getenv("SITE_DOMAIN", ""),
+	})
 	if err != nil {
 		log.Fatalf("unable to index photos: %v", err)
 	}
@@ -53,6 +64,49 @@ func getenv(key, fallback string) string {
 		return value
 	}
 	return fallback
+}
+
+// loadDotEnv reads KEY=VALUE lines from a .env file into the environment. Missing
+// files are ignored. Blank lines and lines starting with '#' are skipped, an
+// optional leading "export " is allowed, and surrounding quotes are stripped.
+// Existing environment variables are never overwritten.
+func loadDotEnv(path string) {
+	file, err := os.Open(path)
+	if err != nil {
+		return
+	}
+	defer file.Close()
+
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		line = strings.TrimPrefix(line, "export ")
+		eq := strings.IndexByte(line, '=')
+		if eq < 0 {
+			continue
+		}
+		key := strings.TrimSpace(line[:eq])
+		if key == "" {
+			continue
+		}
+		if _, ok := os.LookupEnv(key); ok {
+			continue // real environment wins
+		}
+		os.Setenv(key, unquote(strings.TrimSpace(line[eq+1:])))
+	}
+}
+
+// unquote strips a single matching pair of surrounding single or double quotes.
+func unquote(s string) string {
+	if len(s) >= 2 {
+		if (s[0] == '"' && s[len(s)-1] == '"') || (s[0] == '\'' && s[len(s)-1] == '\'') {
+			return s[1 : len(s)-1]
+		}
+	}
+	return s
 }
 
 func durationEnv(key string, fallback time.Duration) time.Duration {

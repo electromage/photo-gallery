@@ -38,7 +38,7 @@ func newTestGallery(t *testing.T) (*Gallery, string) {
 	if err := os.WriteFile(filepath.Join(root, "trip", "big.jpg"), plainJPEG(t, 4000, 3000), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	g, err := New(root, "")
+	g, err := New(Config{PhotoRoot: root})
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -104,7 +104,7 @@ func TestHandleDownloadNeverUpscales(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(root, "small.jpg"), plainJPEG(t, 800, 600), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	g, err := New(root, "")
+	g, err := New(Config{PhotoRoot: root})
 	if err != nil {
 		t.Fatal(err)
 	}

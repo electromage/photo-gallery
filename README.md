@@ -127,14 +127,20 @@ Each index pass logs a one-line summary, e.g.
 
 ## Configuration
 
-All configuration is via environment variables:
+Configuration is via environment variables. You can also put them in a **`.env`
+file** in the working directory (copy [`.env.example`](.env.example) to `.env`) —
+real environment variables always override `.env`, so it's just a convenient default
+layer. Point elsewhere with `GALLERY_ENV_FILE=/path/to/file`.
 
 | Variable | Default | Description |
 |---|---|---|
-| `ADDR` | `:8080` | Address/port to listen on |
+| `SITE_TITLE` | `Photo Gallery` | Title shown in the page `<title>` and the header |
 | `PHOTO_ROOT` | `./photos` | Directory to index and serve (set to `/photos` inside the container) |
+| `SITE_DOMAIN` | _(unset)_ | Public base URL, e.g. `https://photos.example.com`. When set, pages get canonical + Open Graph tags, so shared photo links (`?photo=…`) show a preview with the image |
+| `ADDR` | `:8080` | Address/port to listen on |
 | `GALLERY_REFRESH` | `2m` | How often to rescan for changes (Go duration, e.g. `30s`, `5m`; `0` disables) |
 | `GALLERY_CACHE` | `gallery-cache.gob` | Path to the persisted index cache (`/cache/index.gob` in the Docker image). Set empty to disable persistence |
+| `GALLERY_ENV_FILE` | `.env` | Path to the env file to load at startup |
 
 ## Endpoints
 

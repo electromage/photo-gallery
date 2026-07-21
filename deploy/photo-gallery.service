@@ -9,6 +9,10 @@ Wants=network-online.target
 Environment=PHOTO_ROOT=/srv/photos
 Environment=ADDR=:8080
 Environment=GALLERY_CACHE=/var/lib/photo-gallery/index.gob
+Environment=SITE_TITLE=Matt Blank
+# Public URL; enables shareable link previews (Open Graph). Leave unset if none.
+#Environment=SITE_DOMAIN=https://photos.example.com
+# Alternatively keep settings in a file: EnvironmentFile=/etc/photo-gallery.env
 # How often to pick up added/removed photos (Go duration, e.g. 30s, 5m; 0 disables).
 #Environment=GALLERY_REFRESH=2m
 
