@@ -201,3 +201,7 @@ layer. Point elsewhere with `GALLERY_ENV_FILE=/path/to/file`.
 | `GET /preview/{path}` | Medium cached JPEG (≤2048px) shown in the viewer instead of the original. |
 | `GET /download/{path}?res=1080p` | Download resized to `720p`, `1080p`, `1440p`, `4k`, or `original`. |
 | `GET /healthz` | Health check; returns `ok`. |
+
+## License
+
+[MIT](LICENSE)
