@@ -29,7 +29,7 @@ func TestBuildViewModelSortsByExifNewestFirstAndIndexesAlbumsAndTags(t *testing.
 		t.Fatal(err)
 	}
 
-	g, err := New(root, "")
+	g, err := New(Config{PhotoRoot: root})
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -202,7 +202,7 @@ func TestCachePersistsAndReusesAcrossRestart(t *testing.T) {
 	cachePath := filepath.Join(t.TempDir(), "index.gob")
 
 	// First start: cold index, writes the cache.
-	g1, err := New(root, cachePath)
+	g1, err := New(Config{PhotoRoot: root, CachePath: cachePath})
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -213,7 +213,7 @@ func TestCachePersistsAndReusesAcrossRestart(t *testing.T) {
 
 	// Second start: the cache should load and the entry be reused (searchText,
 	// which gob does not persist, must be rebuilt so search still works).
-	g2, err := New(root, cachePath)
+	g2, err := New(Config{PhotoRoot: root, CachePath: cachePath})
 	if err != nil {
 		t.Fatalf("New (restart): %v", err)
 	}

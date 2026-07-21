@@ -41,10 +41,22 @@ var (
 	xpKeywordsField = exif.XPKeywords
 )
 
+// Config holds the gallery's settings. Add fields here as configuration grows;
+// main wires each one from an environment variable (optionally via a .env file).
+type Config struct {
+	PhotoRoot string // directory to index and serve
+	CachePath string // on-disk index cache; "" disables persistence
+	Title     string // site title (page <title> and header); defaults to "Photo Gallery"
+	Domain    string // public base URL, e.g. https://photos.example.com; enables canonical/OG tags
+}
+
 type Gallery struct {
 	root      string
 	cachePath string // on-disk index cache; "" disables persistence
+	title     string
+	domain    string
 	tmpl      *template.Template
+	indexTmpl *template.Template
 
 	mu    sync.RWMutex
 	state viewModel
@@ -123,6 +135,10 @@ type pageData struct {
 	Query        string
 	CurrentAlbum string
 	ActionURL    string
+	Title        string
+	Canonical    string // absolute URL of this page (only when Domain is set)
+	OGTitle      string // Open Graph title (photo-specific for deep links)
+	OGImage      string // Open Graph image (absolute) for a deep-linked photo
 }
 
 // photoRef is the per-photo payload handed to the viewer's JavaScript: media URL,
@@ -138,10 +154,10 @@ type photoRef struct {
 	Info  []exifKV `json:"info,omitempty"`
 }
 
-// New creates a gallery serving photos under root. If cachePath is non-empty, the
-// index is persisted there (gob) and reused on the next start so restarts skip
-// re-reading unchanged files. Cache problems never prevent the server from running.
-func New(root, cachePath string) (*Gallery, error) {
+// New creates a gallery from cfg. If cfg.CachePath is non-empty, the index is
+// persisted there (gob) and reused on the next start so restarts skip re-reading
+// unchanged files. Cache problems never prevent the server from running.
+func New(cfg Config) (*Gallery, error) {
 	tmpl, err := template.New("gallery").Funcs(template.FuncMap{
 		"albumURL": func(path string) string {
 			if path == "" {
@@ -154,20 +170,39 @@ func New(root, cachePath string) (*Gallery, error) {
 		return nil, err
 	}
 
+	indexTmpl, err := template.New("indexing").Parse(indexingTemplate)
+	if err != nil {
+		return nil, err
+	}
+
+	title := strings.TrimSpace(cfg.Title)
+	if title == "" {
+		title = "Photo Gallery"
+	}
+
 	// Validate the root synchronously so misconfiguration fails fast, then index
 	// in the background so the server can start listening immediately. Large
 	// libraries can take a while to index on first start; the page shows an
 	// "indexing" state until g.ready flips.
+	root := cfg.PhotoRoot
 	if info, err := os.Stat(root); err != nil {
 		return nil, err
 	} else if !info.IsDir() {
 		return nil, fmt.Errorf("%s is not a directory", root)
 	}
 
-	g := &Gallery{root: root, cachePath: cachePath, tmpl: tmpl, cache: map[string]cacheEntry{}}
-	if loaded := loadCache(cachePath); loaded != nil {
+	g := &Gallery{
+		root:      root,
+		cachePath: cfg.CachePath,
+		title:     title,
+		domain:    strings.TrimRight(strings.TrimSpace(cfg.Domain), "/"),
+		tmpl:      tmpl,
+		indexTmpl: indexTmpl,
+		cache:     map[string]cacheEntry{},
+	}
+	if loaded := loadCache(cfg.CachePath); loaded != nil {
 		g.cache = loaded
-		log.Printf("loaded %d cached entries from %s", len(loaded), cachePath)
+		log.Printf("loaded %d cached entries from %s", len(loaded), cfg.CachePath)
 	}
 	go func() {
 		if err := g.Rescan(); err != nil {
@@ -425,7 +460,7 @@ func (g *Gallery) render(w http.ResponseWriter, r *http.Request, currentAlbum st
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		w.Header().Set("Retry-After", "3")
 		w.WriteHeader(http.StatusServiceUnavailable)
-		_, _ = io.WriteString(w, indexingPage)
+		_ = g.indexTmpl.Execute(w, struct{ Title string }{g.title})
 		return
 	}
 
@@ -439,9 +474,28 @@ func (g *Gallery) render(w http.ResponseWriter, r *http.Request, currentAlbum st
 		Query:        query,
 		CurrentAlbum: currentAlbum,
 		ActionURL:    "/",
+		Title:        g.title,
+		OGTitle:      g.title,
 	}
 	if currentAlbum != "" {
 		page.ActionURL = "/albums/" + escapePath(currentAlbum)
+	}
+
+	// With a configured domain, emit canonical + Open Graph tags. For a
+	// deep-linked photo (?photo=path), point the preview at that image and title.
+	if g.domain != "" {
+		page.Canonical = g.domain + r.URL.RequestURI()
+		if photoPath := r.URL.Query().Get("photo"); photoPath != "" {
+			for _, ph := range state.Photos {
+				if ph.MediaPath == photoPath {
+					page.OGImage = g.domain + ph.MediaURL
+					if ph.Title != "" {
+						page.OGTitle = ph.Title + " · " + g.title
+					}
+					break
+				}
+			}
+		}
 	}
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
@@ -871,15 +925,15 @@ func normalizeTerms(terms []string) []string {
 	return normalized
 }
 
-// indexingPage is served before the first index completes. It refreshes itself
-// until the gallery is ready.
-const indexingPage = `<!doctype html>
+// indexingTemplate is served before the first index completes. It refreshes
+// itself until the gallery is ready. {{.Title}} is the configured site title.
+const indexingTemplate = `<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta http-equiv="refresh" content="3">
-  <title>Matt Blank</title>
+  <title>{{.Title}}</title>
   <style>
     body { margin:0; min-height:100vh; display:grid; place-items:center; background:#0b0b0d; color:#ededf0;
       font-family:Inter,system-ui,-apple-system,sans-serif; }
@@ -906,7 +960,14 @@ const pageTemplate = `<!doctype html>
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Matt Blank</title>
+  <title>{{.Title}}</title>
+  <meta property="og:type" content="website">
+  <meta property="og:site_name" content="{{.Title}}">
+  {{if .OGTitle}}<meta property="og:title" content="{{.OGTitle}}">{{end}}
+  {{if .Canonical}}<link rel="canonical" href="{{.Canonical}}">
+  <meta property="og:url" content="{{.Canonical}}">{{end}}
+  {{if .OGImage}}<meta property="og:image" content="{{.OGImage}}">
+  <meta name="twitter:card" content="summary_large_image">{{end}}
   <style>
     :root { color-scheme: dark; --bg:#0b0b0d; --fg:#ededf0; --muted:#8b8b92; --line:#242428; --panel:#161619; --hi:#f4f4f6; }
     * { box-sizing:border-box; }
@@ -1002,7 +1063,7 @@ const pageTemplate = `<!doctype html>
   <svg width="0" height="0" aria-hidden="true" style="position:absolute"><symbol id="ic-dl" viewBox="0 0 24 24"><path d="M12 3v11m0 0l-4-4m4 4l4-4M5 20h14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></symbol><symbol id="ic-info" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9" fill="none" stroke="currentColor" stroke-width="2"/><path d="M12 11v5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><circle cx="12" cy="7.6" r="1.15" fill="currentColor"/></symbol><symbol id="ic-link" viewBox="0 0 24 24"><path d="M9 15l6-6M10.5 6.5l1-1a4 4 0 015.9 5.9l-2 2M13.5 17.5l-1 1a4 4 0 01-5.9-5.9l2-2" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></symbol></svg>
 
   <header>
-    <h1>Matt Blank</h1>
+    <h1>{{.Title}}</h1>
     <form class="search" method="get" action="{{.ActionURL}}">
       <input type="search" name="q" placeholder="Search" value="{{.Query}}" aria-label="Search photos">
     </form>

@@ -5,6 +5,9 @@
 /gallery-cache.gob
 /gallery-cache.gob.tmp
 
+# Local environment config
+/.env
+
 # Local photo library (keep the directory, ignore its contents)
 /photos/*
 !/photos/.gitkeep
