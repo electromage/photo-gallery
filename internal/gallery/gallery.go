@@ -1478,7 +1478,7 @@ const pageTemplate = `<!doctype html>
     .active-filters .af-clear { color:var(--fg); border:1px solid var(--line); border-radius:999px; padding:3px 12px; }
     .active-filters .af-clear:hover { background:#22222a; }
 
-    .grid { display:flex; flex-wrap:wrap; justify-content:center; gap:1px; padding:1.5% 10%; align-content:flex-start; }
+    .grid { display:flex; flex-wrap:wrap; justify-content:center; gap:1px; padding:1.5% 5%; align-content:flex-start; }
     .grid-break { flex:0 0 100%; display:flex; align-items:center; margin:26px 2px 10px; padding:11px 18px;
       border-left:3px solid var(--accent); border-radius:8px;
       background:linear-gradient(90deg, rgba(99,102,241,.22), rgba(99,102,241,.03)); }
