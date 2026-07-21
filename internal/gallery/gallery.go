@@ -132,6 +132,7 @@ type viewModel struct {
 type pageData struct {
 	Albums       []Album
 	Photos       []Photo
+	Items        []gridItem // photos interleaved with month/year section headers
 	PhotosJSON   template.JS
 	ResJSON      template.JS
 	Query        string
@@ -141,6 +142,31 @@ type pageData struct {
 	Canonical    string // absolute URL of this page (only when Domain is set)
 	OGTitle      string // Open Graph title (photo-specific for deep links)
 	OGImage      string // Open Graph image (absolute) for a deep-linked photo
+}
+
+// gridItem is one entry in the rendered grid: either a section header (Header set)
+// or a photo. Index is the photo's position in the PHOTOS payload, used for the
+// tile's data-i so the viewer/filmstrip stay in sync.
+type gridItem struct {
+	Header string
+	Photo  *Photo
+	Index  int
+}
+
+// buildGridItems interleaves month/year headers into the (date-sorted) photos so
+// the feed shows a break whenever the month changes.
+func buildGridItems(photos []Photo) []gridItem {
+	items := make([]gridItem, 0, len(photos)+12)
+	lastKey := ""
+	for i := range photos {
+		key := photos[i].TakenAt.Format("2006-01")
+		if key != lastKey {
+			items = append(items, gridItem{Header: photos[i].TakenAt.Format("January 2006")})
+			lastKey = key
+		}
+		items = append(items, gridItem{Photo: &photos[i], Index: i})
+	}
+	return items
 }
 
 // photoRef is the per-photo payload handed to the viewer's JavaScript: media URL,
@@ -476,6 +502,7 @@ func (g *Gallery) render(w http.ResponseWriter, r *http.Request, currentAlbum st
 	page := pageData{
 		Albums:       filterAlbums(state.Albums, currentAlbum),
 		Photos:       photos,
+		Items:        buildGridItems(photos),
 		PhotosJSON:   photosPayload(photos),
 		ResJSON:      resPayload(),
 		Query:        query,
@@ -1000,6 +1027,11 @@ const pageTemplate = `<!doctype html>
     .chip em { font-style:normal; opacity:.6; margin-left:6px; }
 
     .grid { display:flex; flex-wrap:wrap; justify-content:center; gap:1px; padding:1px; align-content:flex-start; }
+    .grid-break { flex:0 0 100%; display:flex; align-items:baseline; margin:26px 3px 8px; padding-bottom:8px;
+      border-bottom:1px solid var(--line); }
+    .grid-break:first-child { margin-top:8px; }
+    .grid-break span { font-size:.9rem; font-weight:600; color:var(--fg); letter-spacing:.02em;
+      text-transform:uppercase; }
     .tile { position:relative; overflow:hidden; background:var(--panel); cursor:zoom-in; height:320px; flex:0 0 auto; margin:0; }
     .tile img { display:block; height:100%; width:auto; }
     .grid.js .tile img { width:100%; object-fit:cover; }
@@ -1084,7 +1116,7 @@ const pageTemplate = `<!doctype html>
 
   {{if .Photos}}
   <main class="grid" id="grid">
-    {{range $i, $p := .Photos}}<figure class="tile" data-i="{{$i}}"{{if $p.Width}} data-w="{{$p.Width}}" data-h="{{$p.Height}}"{{end}}><img src="{{thumbURL $p.MediaPath}}" alt="{{$p.Title}}" loading="lazy" decoding="async"{{if $p.Width}} width="{{$p.Width}}" height="{{$p.Height}}"{{end}}><button class="tile-dl" data-i="{{$i}}" aria-label="Download"><svg class="ic"><use href="#ic-dl"></use></svg></button></figure>{{end}}
+    {{range .Items}}{{if .Header}}<div class="grid-break"><span>{{.Header}}</span></div>{{else}}{{$p := .Photo}}<figure class="tile" data-i="{{.Index}}"{{if $p.Width}} data-w="{{$p.Width}}" data-h="{{$p.Height}}"{{end}}><img src="{{thumbURL $p.MediaPath}}" alt="{{$p.Title}}" loading="lazy" decoding="async"{{if $p.Width}} width="{{$p.Width}}" height="{{$p.Height}}"{{end}}><button class="tile-dl" data-i="{{.Index}}" aria-label="Download"><svg class="ic"><use href="#ic-dl"></use></svg></button></figure>{{end}}{{end}}
   </main>
   {{else}}
   <div class="empty">No photos in this album or search yet.</div>
@@ -1141,7 +1173,7 @@ const pageTemplate = `<!doctype html>
       var cs = getComputedStyle(grid);
       var cw = grid.clientWidth - parseFloat(cs.paddingLeft) - parseFloat(cs.paddingRight);
       if (cw <= 0) return;
-      var tiles = grid.children, row = [], sum = 0;
+      var children = grid.children, row = [], sum = 0;
       function aspect(t){ var w = +t.dataset.w, h = +t.dataset.h; return (w > 0 && h > 0) ? w / h : 1.5; }
       function flush(last){
         if (!row.length) return;
@@ -1155,8 +1187,9 @@ const pageTemplate = `<!doctype html>
         }
         row = []; sum = 0;
       }
-      for (var i = 0; i < tiles.length; i++){
-        var t = tiles[i];
+      for (var i = 0; i < children.length; i++){
+        var t = children[i];
+        if (!t.classList || !t.classList.contains('tile')) { flush(true); continue; } // section header: end the group's row
         row.push(t); sum += aspect(t);
         if ((cw - gap * (row.length - 1)) / sum <= target) flush(false);
       }
