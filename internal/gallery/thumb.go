@@ -48,7 +48,7 @@ func (g *Gallery) HandleThumb(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	data, err := renderThumb(abs)
+	data, err := renderThumb(abs, g.photoOrient(relSlash))
 	if err != nil {
 		http.Error(w, "could not render thumbnail", http.StatusInternalServerError)
 		return
@@ -61,10 +61,10 @@ func (g *Gallery) HandleThumb(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write(data)
 }
 
-// renderThumb decodes a photo, applies EXIF orientation, scales it down to
-// thumbHeight (never up), and encodes it as JPEG.
-func renderThumb(absPath string) ([]byte, error) {
-	img, err := loadOrientedImage(absPath)
+// renderThumb decodes a photo, applies the given EXIF orientation, scales it down
+// to thumbHeight (never up), and encodes it as JPEG.
+func renderThumb(absPath string, orient int) ([]byte, error) {
+	img, err := loadImageOriented(absPath, orient)
 	if err != nil {
 		return nil, err
 	}

@@ -28,6 +28,7 @@ import (
 	"unicode"
 	"unicode/utf16"
 
+	"github.com/barasher/go-exiftool"
 	"github.com/rwcarlsen/goexif/exif"
 )
 
@@ -59,6 +60,7 @@ type Gallery struct {
 	domain    string
 	tmpl      *template.Template
 	indexTmpl *template.Template
+	et        *exiftool.Exiftool // nil when the exiftool binary is unavailable
 
 	mu    sync.RWMutex
 	state viewModel
@@ -76,9 +78,17 @@ type cacheEntry struct {
 	size  int64
 }
 
+// fileJob is one image discovered during a rescan walk.
+type fileJob struct {
+	abs, rel, album string
+	mod             int64
+	size            int64
+}
+
 // cacheVersion is bumped when the persisted format changes so stale files on disk
-// are ignored rather than misread.
-const cacheVersion = 1
+// are ignored rather than misread. v2: added Photo.Orient and made Width/Height
+// orientation-corrected (display) dimensions.
+const cacheVersion = 2
 
 // persistedEntry / persistedFile are the on-disk (gob) form of the cache. They use
 // exported fields because gob only encodes those; Photo.searchText is unexported
@@ -113,6 +123,7 @@ type Photo struct {
 	Tags       []string
 	Width      int
 	Height     int
+	Orient     int // EXIF orientation 1-8; baked into re-encoded thumbnails/downloads
 	Info       []exifKV
 	searchText string
 }
@@ -233,6 +244,15 @@ func New(cfg Config) (*Gallery, error) {
 		indexTmpl: indexTmpl,
 		cache:     map[string]cacheEntry{},
 	}
+	// exiftool gives the most accurate metadata (including Nikon/Canon maker-note
+	// details like lens names) across camera makes and edited/exported files. If the
+	// binary isn't installed, fall back to the built-in reader.
+	if et, err := exiftool.NewExiftool(exiftool.Buffer(make([]byte, 128*1024), 16*1024*1024)); err != nil {
+		log.Printf("exiftool unavailable, using built-in EXIF reader (install exiftool for full metadata incl. lens names): %v", err)
+	} else {
+		g.et = et
+	}
+
 	if loaded := loadCache(cfg.CachePath); loaded != nil {
 		g.cache = loaded
 		log.Printf("loaded %d cached entries from %s", len(loaded), cfg.CachePath)
@@ -333,12 +353,6 @@ func (g *Gallery) Rescan() error {
 		return fmt.Errorf("%s is not a directory", g.root)
 	}
 
-	type fileJob struct {
-		abs, rel, album string
-		mod             int64
-		size            int64
-	}
-
 	var jobs []fileJob
 	walkErr := filepath.WalkDir(g.root, func(path string, entry fs.DirEntry, err error) error {
 		if err != nil {
@@ -386,6 +400,12 @@ func (g *Gallery) Rescan() error {
 	}
 
 	if len(toProcess) > 0 {
+		// exiftool is fastest in batch mode, so extract all changed files up front
+		// (serially, since the exiftool process isn't concurrency-safe); the worker
+		// pool then just assembles Photos, falling back to the built-in reader for
+		// any file exiftool couldn't handle.
+		prefetched := g.extractExifBatch(jobs, toProcess)
+
 		workers := runtime.NumCPU()
 		if workers > 8 {
 			workers = 8 // metadata reads are largely disk-bound
@@ -398,7 +418,13 @@ func (g *Gallery) Rescan() error {
 				defer wg.Done()
 				for idx := range queue {
 					j := jobs[idx]
-					photo := buildPhoto(j.abs, j.rel, j.album, time.Unix(0, j.mod))
+					md, ok := prefetched[j.abs]
+					if !ok {
+						if m, err := readMetadata(j.abs); err == nil {
+							md = m
+						}
+					}
+					photo := buildPhoto(j.abs, j.rel, j.album, time.Unix(0, j.mod), md)
 					photos[idx] = photo
 					cacheMu.Lock()
 					newCache[j.rel] = cacheEntry{photo: photo, mod: j.mod, size: j.size}
@@ -574,30 +600,22 @@ func resPayload() template.JS {
 	return template.JS(data)
 }
 
-// buildPhoto reads a single photo's metadata and assembles its Photo. It is
-// best-effort: if metadata cannot be read, it falls back to the filename (title)
-// and the file's modification time (date). modTime is the stat already collected
-// during the walk, so no extra os.Stat is needed here.
-func buildPhoto(absPath, relPath, albumPath string, modTime time.Time) Photo {
+// buildPhoto assembles a Photo from already-extracted metadata. It is best-effort:
+// a missing title falls back to the filename, and a missing capture date falls back
+// to the file's modification time (modTime, collected during the walk).
+func buildPhoto(absPath, relPath, albumPath string, modTime time.Time, md metadata) Photo {
 	takenAt := modTime
-	title := strings.TrimSuffix(filepath.Base(relPath), filepath.Ext(relPath))
-	tags := make([]string, 0, 4)
-	var width, height int
-	var info []exifKV
-
-	if metadata, err := readMetadata(absPath); err == nil {
-		if !metadata.takenAt.IsZero() {
-			takenAt = metadata.takenAt
-		}
-		if metadata.title != "" {
-			title = metadata.title
-		}
-		tags = append(tags, metadata.tags...)
-		width, height = metadata.width, metadata.height
-		info = metadata.info
+	if !md.takenAt.IsZero() {
+		takenAt = md.takenAt
 	}
-
-	tags = normalizeTerms(tags)
+	title := md.title
+	if title == "" {
+		title = strings.TrimSuffix(filepath.Base(relPath), filepath.Ext(relPath))
+	}
+	orient := md.orient
+	if orient < 1 || orient > 8 {
+		orient = 1
+	}
 
 	photo := Photo{
 		Title:      title,
@@ -607,14 +625,75 @@ func buildPhoto(absPath, relPath, albumPath string, modTime time.Time) Photo {
 		MediaURL:   "/media/" + escapePath(relPath),
 		TakenAt:    takenAt.UTC(),
 		TakenAtUTC: takenAt.UTC().Format("02 Jan 2006"),
-		Tags:       tags,
-		Width:      width,
-		Height:     height,
-		Info:       info,
+		Tags:       normalizeTerms(md.tags),
+		Width:      md.width,
+		Height:     md.height,
+		Orient:     orient,
+		Info:       md.info,
 	}
 	photo.searchText = searchTextFor(photo)
 
 	return photo
+}
+
+// extractMetadata returns a photo's metadata using exiftool when available, or the
+// built-in reader as a fallback (the two produce equivalent metadata structs).
+func (g *Gallery) extractMetadata(absPath string) metadata {
+	if g.et != nil {
+		results := g.et.ExtractMetadata(absPath)
+		if len(results) == 1 && results[0].Err == nil {
+			return metadataFromExiftool(results[0])
+		}
+	}
+	if md, err := readMetadata(absPath); err == nil {
+		return md
+	}
+	return metadata{}
+}
+
+// extractExifBatch runs exiftool over the files that need processing, in chunks,
+// returning metadata keyed by absolute path. Returns nil when exiftool is absent
+// (callers then fall back to the built-in reader per file).
+func (g *Gallery) extractExifBatch(jobs []fileJob, idxs []int) map[string]metadata {
+	if g.et == nil {
+		return nil
+	}
+	paths := make([]string, len(idxs))
+	for i, idx := range idxs {
+		paths[i] = jobs[idx].abs
+	}
+	out := make(map[string]metadata, len(paths))
+	const chunk = 200
+	for start := 0; start < len(paths); start += chunk {
+		end := start + chunk
+		if end > len(paths) {
+			end = len(paths)
+		}
+		for _, fm := range g.et.ExtractMetadata(paths[start:end]...) {
+			if fm.Err == nil {
+				out[fm.File] = metadataFromExiftool(fm)
+			}
+		}
+	}
+	return out
+}
+
+// photoOrient returns the stored EXIF orientation for an indexed photo (by media
+// path), used to bake rotation into re-encoded thumbnails/downloads. Defaults to 1.
+func (g *Gallery) photoOrient(mediaPath string) int {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+	if entry, ok := g.cache[mediaPath]; ok && entry.photo.Orient >= 1 {
+		return entry.photo.Orient
+	}
+	return 1
+}
+
+// Close releases the exiftool subprocess, if any.
+func (g *Gallery) Close() {
+	if g.et != nil {
+		_ = g.et.Close()
+	}
 }
 
 // searchTextFor builds the lowercased haystack used by search. It is also used to
@@ -635,6 +714,7 @@ type metadata struct {
 	tags    []string
 	width   int
 	height  int
+	orient  int
 	info    []exifKV
 }
 
@@ -682,10 +762,187 @@ func readMetadata(path string) (metadata, error) {
 			result.title = firstExifString(data, titleFields...)
 		}
 		result.tags = append(result.tags, collectExifTags(data)...)
+		if s := exifInt(data, "Orientation"); s != "" {
+			if n, err := strconv.Atoi(s); err == nil && n >= 1 && n <= 8 {
+				result.orient = n
+			}
+		}
+	}
+
+	// DecodeConfig returns stored (unrotated) dimensions; swap them for photos the
+	// orientation flag says are rotated 90/270 so the grid gets display dimensions.
+	if result.orient >= 5 && result.orient <= 8 {
+		result.width, result.height = result.height, result.width
 	}
 
 	result.info = buildInfo(exifData, result.width, result.height)
 	return result, nil
+}
+
+// metadataFromExiftool maps exiftool's fields onto our metadata struct. exiftool's
+// print conversions give friendly values (decoded lens names, "50.0 mm", "1/250"),
+// so most are used as-is.
+func metadataFromExiftool(fm exiftool.FileMetadata) metadata {
+	md := metadata{}
+
+	for _, key := range []string{"DateTimeOriginal", "SubSecDateTimeOriginal", "CreateDate", "ModifyDate"} {
+		if t, ok := parseExifTime(fmStr(fm, key)); ok {
+			md.takenAt = t
+			break
+		}
+	}
+	for _, key := range []string{"Title", "ImageDescription", "XPTitle", "ObjectName"} {
+		if v := fmStr(fm, key); v != "" {
+			md.title = v
+			break
+		}
+	}
+	md.tags = append(md.tags, fmStrings(fm, "Keywords")...)
+	md.tags = append(md.tags, fmStrings(fm, "Subject")...)
+
+	md.orient = parseOrientation(fmStr(fm, "Orientation"))
+	w, h := fmInt(fm, "ImageWidth"), fmInt(fm, "ImageHeight")
+	if w == 0 || h == 0 {
+		w, h = fmInt(fm, "ExifImageWidth"), fmInt(fm, "ExifImageHeight")
+	}
+	if md.orient >= 5 && md.orient <= 8 {
+		w, h = h, w
+	}
+	md.width, md.height = w, h
+
+	add := func(label, value string) {
+		if strings.TrimSpace(value) != "" {
+			md.info = append(md.info, exifKV{Label: label, Value: strings.TrimSpace(value)})
+		}
+	}
+	add("Camera", cameraName(fmStr(fm, "Make"), fmStr(fm, "Model")))
+	add("Lens", firstNonEmpty(fmStr(fm, "LensID"), fmStr(fm, "Lens"), fmStr(fm, "LensModel")))
+	add("Focal length", fmStr(fm, "FocalLength"))
+	if v := fmStr(fm, "FNumber"); v != "" {
+		add("Aperture", "f/"+v)
+	} else if v := fmStr(fm, "Aperture"); v != "" {
+		add("Aperture", "f/"+v)
+	}
+	if v := fmStr(fm, "ExposureTime"); v != "" {
+		add("Shutter", v+" s")
+	}
+	add("ISO", fmStr(fm, "ISO"))
+	if w > 0 && h > 0 {
+		add("Dimensions", fmt.Sprintf("%d × %d", w, h))
+	}
+	return md
+}
+
+// fmStr reads a field as a trimmed string, formatting numeric/bool values.
+func fmStr(fm exiftool.FileMetadata, key string) string {
+	v, ok := fm.Fields[key]
+	if !ok {
+		return ""
+	}
+	switch x := v.(type) {
+	case string:
+		return strings.TrimSpace(x)
+	case float64:
+		if x == math.Trunc(x) {
+			return strconv.FormatInt(int64(x), 10)
+		}
+		return strconv.FormatFloat(x, 'g', -1, 64)
+	case bool:
+		return strconv.FormatBool(x)
+	default:
+		return strings.TrimSpace(fmt.Sprintf("%v", v))
+	}
+}
+
+// fmInt reads a field as an int (exiftool numbers arrive as float64).
+func fmInt(fm exiftool.FileMetadata, key string) int {
+	switch x := fm.Fields[key].(type) {
+	case float64:
+		return int(x)
+	case string:
+		fields := strings.Fields(x)
+		if len(fields) > 0 {
+			n, _ := strconv.Atoi(fields[0])
+			return n
+		}
+	}
+	return 0
+}
+
+// fmStrings reads a field that may be a single value or a list (e.g. Keywords).
+func fmStrings(fm exiftool.FileMetadata, key string) []string {
+	v, ok := fm.Fields[key]
+	if !ok {
+		return nil
+	}
+	switch x := v.(type) {
+	case []interface{}:
+		out := make([]string, 0, len(x))
+		for _, e := range x {
+			out = append(out, fmt.Sprintf("%v", e))
+		}
+		return out
+	case string:
+		return []string{x}
+	default:
+		return []string{fmt.Sprintf("%v", v)}
+	}
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, v := range values {
+		if strings.TrimSpace(v) != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+// parseExifTime parses exiftool/EXIF timestamps ("2006:01:02 15:04:05", optionally
+// with sub-seconds or a timezone suffix), ignoring the zero value.
+func parseExifTime(v string) (time.Time, bool) {
+	if len(v) < 19 || strings.HasPrefix(v, "0000") {
+		return time.Time{}, false
+	}
+	t, err := time.Parse("2006:01:02 15:04:05", v[:19])
+	if err != nil {
+		return time.Time{}, false
+	}
+	return t, true
+}
+
+// parseOrientation converts exiftool's Orientation (a descriptive string with print
+// conversion on, e.g. "Rotate 90 CW") or a raw number into an EXIF orientation 1-8.
+func parseOrientation(s string) int {
+	s = strings.TrimSpace(s)
+	switch s {
+	case "", "Horizontal (normal)":
+		return 1
+	case "Mirror horizontal":
+		return 2
+	case "Rotate 180":
+		return 3
+	case "Mirror vertical":
+		return 4
+	case "Mirror horizontal and rotate 270 CW":
+		return 5
+	case "Rotate 90 CW":
+		return 6
+	case "Mirror horizontal and rotate 90 CW":
+		return 7
+	case "Rotate 270 CW":
+		return 8
+	}
+	if n, err := strconv.Atoi(s); err == nil && n >= 1 && n <= 8 {
+		return n
+	}
+	if strings.Contains(s, "270") {
+		return 8
+	}
+	if strings.Contains(s, "90") {
+		return 6
+	}
+	return 1
 }
 
 // buildInfo assembles the ordered EXIF fields shown in the viewer's info panel.

@@ -15,8 +15,17 @@ it builds a public, browsable archive. Meant as an easy way to get off Flickr.
 It's a single Go binary with no runtime dependencies, so it's easy to run in Docker or
 straight on a server.
 
-> **Note:** photos are indexed by capture date, title, and tags read from **JPEG**
-> EXIF/XMP metadata. JPEG (`.jpg` / `.jpeg`) is the supported input format.
+> **Note:** photos are indexed by capture date, title, tags, and camera details read
+> from **JPEG** EXIF/XMP metadata. JPEG (`.jpg` / `.jpeg`) is the supported input format.
+>
+> **Metadata is read with [ExifTool](https://exiftool.org/)** when the `exiftool`
+> binary is available — it's the most accurate across camera makes, including Nikon
+> and Canon lens names and edited/exported files. If ExifTool isn't installed the app
+> still runs, falling back to a built-in reader with less coverage (and photos whose
+> capture date can't be read fall back to file modification time, which can look
+> out of order). Install it with `apt install libimage-exiftool-perl` (Debian/Ubuntu),
+> `apk add exiftool` (Alpine), or `brew install exiftool` (macOS). The Docker image
+> includes it.
 
 ---
 
@@ -74,7 +83,8 @@ docker compose up -d --build
 
 ## Running without Docker
 
-Requires [Go 1.23+](https://go.dev/dl/).
+Requires [Go 1.23+](https://go.dev/dl/), and [ExifTool](https://exiftool.org/) for
+full metadata (optional but recommended — see the note above).
 
 ```bash
 # Serve ./photos on http://localhost:8080
@@ -107,9 +117,10 @@ Designed to handle large libraries (tens of thousands of photos):
 - **Non-blocking startup.** The server starts listening immediately and shows an
   "indexing…" page (that auto-refreshes) until the first pass finishes — it never
   hangs the way a blocking indexer would.
-- **Fast indexing.** Files are processed in parallel, and only the first ~512 KiB of
-  each photo is read (enough for EXIF/XMP and dimensions) instead of the whole file,
-  so a cold index of thousands of photos takes seconds, not minutes.
+- **Fast indexing.** When ExifTool is present, metadata is extracted in batches; the
+  built-in fallback reader processes files in parallel and reads only the first
+  ~512 KiB of each. Either way the index is cached, so only the first cold pass does
+  the full work.
 - **Automatic updates.** A background rescan runs every `GALLERY_REFRESH` (default
   2 minutes). Add, change, or remove photos and they show up on the next tick — no
   restart needed. Set `GALLERY_REFRESH=15s` for faster pickup; rescans are cheap.

@@ -82,7 +82,7 @@ func TestBuildPhotoFallsBackToFileModTimeWhenExifMissing(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	photo := buildPhoto(path, "plain.jpg", "", want)
+	photo := buildPhoto(path, "plain.jpg", "", want, metadata{})
 	if !photo.TakenAt.Equal(want) {
 		t.Fatalf("expected modtime fallback %s, got %s", want, photo.TakenAt)
 	}
