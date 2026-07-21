@@ -1478,7 +1478,7 @@ const pageTemplate = `<!doctype html>
     .active-filters .af-clear { color:var(--fg); border:1px solid var(--line); border-radius:999px; padding:3px 12px; }
     .active-filters .af-clear:hover { background:#22222a; }
 
-    .grid { display:flex; flex-wrap:wrap; justify-content:center; gap:1px; padding:1px; align-content:flex-start; }
+    .grid { display:flex; flex-wrap:wrap; justify-content:center; gap:1px; padding:1.5% 10%; align-content:flex-start; }
     .grid-break { flex:0 0 100%; display:flex; align-items:center; margin:26px 2px 10px; padding:11px 18px;
       border-left:3px solid var(--accent); border-radius:8px;
       background:linear-gradient(90deg, rgba(99,102,241,.22), rgba(99,102,241,.03)); }
@@ -1548,6 +1548,7 @@ const pageTemplate = `<!doctype html>
     .toast.show { opacity:1; transform:translateX(-50%) translateY(0); }
 
     @media (max-width:600px) {
+      .grid { padding:4% 4%; }
       .tile { height:200px; }
       .v-nav { width:40px; height:56px; font-size:1.5rem; }
     }
@@ -1645,10 +1646,14 @@ const pageTemplate = `<!doctype html>
     // top-to-bottom, newest first.
     function layoutGrid(){
       if (!grid) return;
-      var gap = 1, target = 320;
+      var target = 320;
       var cs = getComputedStyle(grid);
       var cw = grid.clientWidth - parseFloat(cs.paddingLeft) - parseFloat(cs.paddingRight);
       if (cw <= 0) return;
+      // Gap ~1% of the available width, kept in sync between the CSS and the math.
+      var gap = Math.max(1, Math.round(cw * 0.01));
+      grid.style.columnGap = gap + 'px';
+      grid.style.rowGap = gap + 'px';
       var children = grid.children, row = [], sum = 0;
       function aspect(t){ var w = +t.dataset.w, h = +t.dataset.h; return (w > 0 && h > 0) ? w / h : 1.5; }
       function flush(last){
