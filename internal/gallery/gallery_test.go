@@ -29,10 +29,11 @@ func TestBuildViewModelSortsByExifNewestFirstAndIndexesAlbumsAndTags(t *testing.
 		t.Fatal(err)
 	}
 
-	vm, err := buildViewModel(root)
+	g, err := New(root, "")
 	if err != nil {
-		t.Fatalf("buildViewModel: %v", err)
+		t.Fatalf("New: %v", err)
 	}
+	vm := waitForIndex(t, g)
 
 	if len(vm.Albums) != 1 {
 		t.Fatalf("expected 1 album, got %d", len(vm.Albums))
@@ -81,12 +82,29 @@ func TestBuildPhotoFallsBackToFileModTimeWhenExifMissing(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	photo, err := buildPhoto(path, "plain.jpg", "")
-	if err != nil {
-		t.Fatalf("buildPhoto: %v", err)
-	}
+	photo := buildPhoto(path, "plain.jpg", "", want)
 	if !photo.TakenAt.Equal(want) {
 		t.Fatalf("expected modtime fallback %s, got %s", want, photo.TakenAt)
+	}
+}
+
+// waitForIndex blocks until the gallery's background index finishes, then returns
+// a snapshot of its state.
+func waitForIndex(t *testing.T, g *Gallery) viewModel {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		g.mu.RLock()
+		ready := g.ready
+		state := g.state
+		g.mu.RUnlock()
+		if ready {
+			return state
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("index did not become ready in time")
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
 }
 
@@ -174,4 +192,42 @@ func writeIFDEntry(buf *bytes.Buffer, tag uint16, fieldType uint16, count uint32
 	_ = binary.Write(buf, binary.LittleEndian, fieldType)
 	_ = binary.Write(buf, binary.LittleEndian, count)
 	_ = binary.Write(buf, binary.LittleEndian, valueOrOffset)
+}
+
+func TestCachePersistsAndReusesAcrossRestart(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "a.jpg"), testJPEG(t, "2024:05:06 07:08:09", []string{"sunset"}, "Golden Hour"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cachePath := filepath.Join(t.TempDir(), "index.gob")
+
+	// First start: cold index, writes the cache.
+	g1, err := New(root, cachePath)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	waitForIndex(t, g1)
+	if _, err := os.Stat(cachePath); err != nil {
+		t.Fatalf("cache file not written: %v", err)
+	}
+
+	// Second start: the cache should load and the entry be reused (searchText,
+	// which gob does not persist, must be rebuilt so search still works).
+	g2, err := New(root, cachePath)
+	if err != nil {
+		t.Fatalf("New (restart): %v", err)
+	}
+	g2.mu.RLock()
+	loaded := len(g2.cache)
+	g2.mu.RUnlock()
+	if loaded != 1 {
+		t.Fatalf("expected 1 entry loaded from cache, got %d", loaded)
+	}
+	vm := waitForIndex(t, g2)
+	if len(vm.Photos) != 1 {
+		t.Fatalf("expected 1 photo after restart, got %d", len(vm.Photos))
+	}
+	if got := filterPhotos(vm.Photos, "", "sunset"); len(got) != 1 {
+		t.Fatalf("search on cached photo failed; searchText not rebuilt (got %d)", len(got))
+	}
 }

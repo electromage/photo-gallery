@@ -12,9 +12,10 @@ import (
 func main() {
 	photoRoot := getenv("PHOTO_ROOT", "./photos")
 	addr := getenv("ADDR", ":8080")
+	cachePath := getenv("GALLERY_CACHE", "gallery-cache.gob")
 	refreshInterval := durationEnv("GALLERY_REFRESH", 2*time.Minute)
 
-	app, err := gallery.New(photoRoot)
+	app, err := gallery.New(photoRoot, cachePath)
 	if err != nil {
 		log.Fatalf("unable to index photos: %v", err)
 	}
@@ -33,6 +34,7 @@ func main() {
 
 	mux := http.NewServeMux()
 	mux.Handle("/media/", http.StripPrefix("/media/", http.FileServer(http.FS(os.DirFS(photoRoot)))))
+	mux.HandleFunc("/download/", app.HandleDownload)
 	mux.HandleFunc("/albums/", app.HandleAlbum)
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
