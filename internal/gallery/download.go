@@ -10,8 +10,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-
-	"github.com/rwcarlsen/goexif/exif"
 )
 
 // downloadSize is a named target that a photo can be downscaled to before
@@ -72,7 +70,7 @@ func (g *Gallery) HandleDownload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	img, err := loadOrientedImage(absPath)
+	img, err := loadImageOriented(absPath, g.photoOrient(relSlash))
 	if err != nil {
 		http.Error(w, "could not read image", http.StatusInternalServerError)
 		return
@@ -120,9 +118,11 @@ func (g *Gallery) resolvePhoto(rel string) (absPath, relSlash string, ok bool) {
 	return abs, filepath.ToSlash(cleaned), true
 }
 
-// loadOrientedImage decodes a JPEG and applies its EXIF orientation so the
-// re-encoded output is upright (re-encoding otherwise discards EXIF).
-func loadOrientedImage(path string) (image.Image, error) {
+// loadImageOriented decodes a JPEG and applies the given EXIF orientation so the
+// re-encoded output is upright (re-encoding otherwise discards EXIF). The
+// orientation comes from the index, which was read by exiftool or the built-in
+// reader when the photo was scanned.
+func loadImageOriented(path string, orient int) (image.Image, error) {
 	file, err := os.Open(path)
 	if err != nil {
 		return nil, err
@@ -133,31 +133,7 @@ func loadOrientedImage(path string) (image.Image, error) {
 	if err != nil {
 		return nil, err
 	}
-
-	orientation := readOrientation(path)
-	return applyOrientation(img, orientation), nil
-}
-
-func readOrientation(path string) int {
-	file, err := os.Open(path)
-	if err != nil {
-		return 1
-	}
-	defer file.Close()
-
-	data, err := exif.Decode(file)
-	if err != nil {
-		return 1
-	}
-	tag, err := data.Get(exif.Orientation)
-	if err != nil {
-		return 1
-	}
-	value, err := tag.Int(0)
-	if err != nil {
-		return 1
-	}
-	return value
+	return applyOrientation(img, orient), nil
 }
 
 // applyOrientation returns img transformed per the EXIF orientation value (1-8).
