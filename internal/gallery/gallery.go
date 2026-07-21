@@ -1417,10 +1417,13 @@ const pageTemplate = `<!doctype html>
   {{if .OGImage}}<meta property="og:image" content="{{.OGImage}}">
   <meta name="twitter:card" content="summary_large_image">{{end}}
   <style>
-    :root { color-scheme: dark; --bg:#0b0b0d; --fg:#ededf0; --muted:#8b8b92; --line:#242428; --panel:#161619; --hi:#f4f4f6; }
+    :root { color-scheme: dark; --bg:#0b0b0d; --fg:#ededf0; --muted:#8b8b92; --line:#242428; --panel:#161619; --hi:#f4f4f6; --accent:#6366f1; }
     * { box-sizing:border-box; }
     html, body { margin:0; }
-    body { font-family:Inter,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; background:var(--bg); color:var(--fg); -webkit-font-smoothing:antialiased; }
+    html { background:var(--bg); }
+    body { font-family:Inter,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; background:transparent; color:var(--fg); -webkit-font-smoothing:antialiased; }
+    /* Ambient background tinted by the colors of the photos currently on screen. */
+    #ambient { position:fixed; inset:0; z-index:-1; pointer-events:none; background:var(--bg); }
     a { color:inherit; text-decoration:none; }
     button { font:inherit; color:inherit; cursor:pointer; }
 
@@ -1475,11 +1478,12 @@ const pageTemplate = `<!doctype html>
     .active-filters .af-clear { color:var(--fg); border:1px solid var(--line); border-radius:999px; padding:3px 12px; }
     .active-filters .af-clear:hover { background:#22222a; }
 
-    .grid { display:flex; flex-wrap:wrap; justify-content:center; gap:1px; padding:1px; align-content:flex-start; }
-    .grid-break { flex:0 0 100%; display:flex; align-items:baseline; margin:26px 3px 8px; padding-bottom:8px;
-      border-bottom:1px solid var(--line); }
-    .grid-break:first-child { margin-top:8px; }
-    .grid-break span { font-size:.9rem; font-weight:600; color:var(--fg); letter-spacing:.02em;
+    .grid { display:flex; flex-wrap:wrap; justify-content:center; gap:1px; padding:1.5% 10%; align-content:flex-start; }
+    .grid-break { flex:0 0 100%; display:flex; align-items:center; margin:26px 2px 10px; padding:11px 18px;
+      border-left:3px solid var(--accent); border-radius:8px;
+      background:linear-gradient(90deg, rgba(99,102,241,.22), rgba(99,102,241,.03)); }
+    .grid-break:first-child { margin-top:10px; }
+    .grid-break span { font-size:1.08rem; font-weight:600; color:var(--fg); letter-spacing:.03em;
       text-transform:uppercase; }
     .tile { position:relative; overflow:hidden; background:var(--panel); cursor:zoom-in; height:320px; flex:0 0 auto; margin:0; }
     .tile img { display:block; height:100%; width:auto; }
@@ -1544,12 +1548,14 @@ const pageTemplate = `<!doctype html>
     .toast.show { opacity:1; transform:translateX(-50%) translateY(0); }
 
     @media (max-width:600px) {
+      .grid { padding:4% 4%; }
       .tile { height:200px; }
       .v-nav { width:40px; height:56px; font-size:1.5rem; }
     }
   </style>
 </head>
 <body>
+  <div id="ambient"></div>
   <svg width="0" height="0" aria-hidden="true" style="position:absolute"><symbol id="ic-dl" viewBox="0 0 24 24"><path d="M12 3v11m0 0l-4-4m4 4l4-4M5 20h14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></symbol><symbol id="ic-info" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9" fill="none" stroke="currentColor" stroke-width="2"/><path d="M12 11v5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><circle cx="12" cy="7.6" r="1.15" fill="currentColor"/></symbol><symbol id="ic-link" viewBox="0 0 24 24"><path d="M9 15l6-6M10.5 6.5l1-1a4 4 0 015.9 5.9l-2 2M13.5 17.5l-1 1a4 4 0 01-5.9-5.9l2-2" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></symbol></svg>
 
   <header>
@@ -1640,10 +1646,14 @@ const pageTemplate = `<!doctype html>
     // top-to-bottom, newest first.
     function layoutGrid(){
       if (!grid) return;
-      var gap = 1, target = 320;
+      var target = 320;
       var cs = getComputedStyle(grid);
       var cw = grid.clientWidth - parseFloat(cs.paddingLeft) - parseFloat(cs.paddingRight);
       if (cw <= 0) return;
+      // Gap ~1% of the available width, kept in sync between the CSS and the math.
+      var gap = Math.max(1, Math.round(cw * 0.01));
+      grid.style.columnGap = gap + 'px';
+      grid.style.rowGap = gap + 'px';
       var children = grid.children, row = [], sum = 0;
       function aspect(t){ var w = +t.dataset.w, h = +t.dataset.h; return (w > 0 && h > 0) ? w / h : 1.5; }
       function flush(last){
@@ -1867,6 +1877,88 @@ const pageTemplate = `<!doctype html>
       var dx = e.changedTouches[0].clientX - tx;
       if (Math.abs(dx) > 40) { if (dx < 0) next(); else prev(); }
     }, { passive: true });
+
+    // Ambient background: tint a fixed backdrop with the average colors of the
+    // thumbnails currently on screen (top-of-view color at the top, bottom at the
+    // bottom), blended heavily into the dark base so it stays subtle.
+    (function ambient(){
+      var el = document.getElementById('ambient');
+      if (!el || !grid) return;
+      var base = [11, 11, 13], strength = 0.28;
+      var snap = matchMedia('(prefers-reduced-motion: reduce)').matches;
+      var cnv = document.createElement('canvas'); cnv.width = cnv.height = 1;
+      var cx = cnv.getContext('2d', { willReadFrequently: true });
+      var cache = {}; // data-i -> [r,g,b] | null (failed)
+
+      function colorOf(tile){
+        var i = tile.dataset.i;
+        if (i in cache) return cache[i];
+        var img = tile.querySelector('img');
+        if (!img) return (cache[i] = null);
+        if (!img.complete) return undefined;       // still loading — try again later
+        if (!img.naturalWidth) return (cache[i] = null); // failed to load
+        try {
+          cx.drawImage(img, 0, 0, 1, 1);           // 1x1 draw = average color
+          var d = cx.getImageData(0, 0, 1, 1).data;
+          return (cache[i] = [d[0], d[1], d[2]]);
+        } catch (e) { return (cache[i] = null); }
+      }
+      function tint(c){
+        return [
+          Math.round(base[0] + (c[0] - base[0]) * strength),
+          Math.round(base[1] + (c[1] - base[1]) * strength),
+          Math.round(base[2] + (c[2] - base[2]) * strength)
+        ];
+      }
+
+      var visible = new Set();
+      var io = new IntersectionObserver(function(entries){
+        entries.forEach(function(e){ e.isIntersecting ? visible.add(e.target) : visible.delete(e.target); });
+        schedule();
+      }, { threshold: 0 });
+      grid.querySelectorAll('.tile').forEach(function(t){ io.observe(t); });
+
+      var cur = [base.slice(), base.slice()], tgt = [base.slice(), base.slice()];
+      var scheduled = false, raf = null;
+
+      function schedule(){
+        if (scheduled) return; scheduled = true;
+        requestAnimationFrame(function(){ scheduled = false; compute(); });
+      }
+      function compute(){
+        var mid = innerHeight / 2, waiting = false;
+        var top = [0, 0, 0], tn = 0, bot = [0, 0, 0], bn = 0;
+        visible.forEach(function(t){
+          var c = colorOf(t);
+          if (c === undefined) { waiting = true; return; }
+          if (!c) return;
+          var r = t.getBoundingClientRect();
+          if (r.top + r.height / 2 < mid) { top[0]+=c[0]; top[1]+=c[1]; top[2]+=c[2]; tn++; }
+          else { bot[0]+=c[0]; bot[1]+=c[1]; bot[2]+=c[2]; bn++; }
+        });
+        if (tn || bn) {
+          var ta = tn ? [top[0]/tn, top[1]/tn, top[2]/tn] : [bot[0]/bn, bot[1]/bn, bot[2]/bn];
+          var ba = bn ? [bot[0]/bn, bot[1]/bn, bot[2]/bn] : ta;
+          tgt = [tint(ta), tint(ba)];
+          animate();
+        }
+        if (waiting) setTimeout(schedule, 200); // some thumbnails still loading
+      }
+      function animate(){
+        var k = snap ? 1 : 0.08, settled = true;
+        for (var g = 0; g < 2; g++) for (var i = 0; i < 3; i++) {
+          cur[g][i] += (tgt[g][i] - cur[g][i]) * k;
+          if (Math.abs(cur[g][i] - tgt[g][i]) > 0.5) settled = false;
+        }
+        el.style.background = 'linear-gradient(180deg, rgb(' + rgb(cur[0]) + '), rgb(' + rgb(cur[1]) + '))';
+        raf = settled ? null : requestAnimationFrame(animate);
+      }
+      function rgb(c){ return Math.round(c[0]) + ',' + Math.round(c[1]) + ',' + Math.round(c[2]); }
+
+      addEventListener('scroll', schedule, { passive: true });
+      addEventListener('resize', schedule, { passive: true });
+      schedule();
+    })();
 
     // Open the viewer if the page was loaded with a ?photo= deep link.
     var initPhoto = new URL(location.href).searchParams.get('photo');
