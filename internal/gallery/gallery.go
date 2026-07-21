@@ -17,6 +17,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"runtime"
@@ -47,20 +48,33 @@ var (
 type Config struct {
 	PhotoRoot  string // directory to index and serve
 	CachePath  string // on-disk index cache; "" disables persistence
-	ThumbCache string // directory for generated thumbnails; "" generates on the fly (no caching)
+	ThumbCache string // directory for generated thumbnails/previews; "" generates on the fly (no caching)
+	WarmCache  bool   // pre-generate thumbnails/previews in the background after indexing
 	Title      string // site title (page <title> and header); defaults to "Photo Gallery"
 	Domain     string // public base URL, e.g. https://photos.example.com; enables canonical/OG tags
+
+	ThumbHeight    int            // thumbnail max height in px (0 = default)
+	ThumbQuality   int            // thumbnail JPEG/WebP quality 1-100 (0 = default)
+	PreviewMax     int            // preview max longest edge in px (0 = default)
+	PreviewQuality int            // preview JPEG/WebP quality 1-100 (0 = default)
+	DownloadSizes  []DownloadSize // download resolution presets (nil = default)
 }
 
 type Gallery struct {
 	root      string
 	cachePath string // on-disk index cache; "" disables persistence
-	thumbDir  string // thumbnail cache directory; "" disables caching
+	thumbDir  string // thumbnail/preview cache directory; "" disables caching
+	warm      bool   // pre-generate renditions in the background
+	cwebp     string // path to the cwebp binary; "" encodes renditions as JPEG
 	title     string
 	domain    string
-	tmpl      *template.Template
-	indexTmpl *template.Template
-	et        *exiftool.Exiftool // nil when the exiftool binary is unavailable
+
+	thumbV        variant
+	previewV      variant
+	downloadSizes []DownloadSize
+	tmpl          *template.Template
+	indexTmpl     *template.Template
+	et            *exiftool.Exiftool // nil when the exiftool binary is unavailable
 
 	mu    sync.RWMutex
 	state viewModel
@@ -68,6 +82,7 @@ type Gallery struct {
 	cache map[string]cacheEntry // key: MediaPath; lets rescans skip unchanged files
 
 	rescanMu sync.Mutex // serializes rescans so overlapping ticks are skipped
+	warmMu   sync.Mutex // ensures only one cache-warm pass runs at a time
 }
 
 // cacheEntry remembers a processed photo along with the file stats used to decide
@@ -104,12 +119,21 @@ type persistedFile struct {
 	Entries map[string]persistedEntry
 }
 
-type Album struct {
-	Path   string
-	Name   string
-	Count  int
-	Cover  string
-	Active bool
+// AlbumNode is a folder in the album tree. Count is the number of photos in the
+// whole subtree (this folder plus all descendants). Active/Open are set per request.
+type AlbumNode struct {
+	Path     string
+	Name     string
+	Count    int
+	Children []*AlbumNode
+	Active   bool // this folder is the current album
+	Open     bool // this folder is on the path to the current album (expanded)
+}
+
+// KeywordCount is a keyword/tag and how many photos carry it.
+type KeywordCount struct {
+	Name  string
+	Count int
 }
 
 type Photo struct {
@@ -135,24 +159,28 @@ type exifKV struct {
 }
 
 type viewModel struct {
-	Albums    []Album
+	Tree      *AlbumNode
+	Keywords  []KeywordCount
 	Photos    []Photo
 	IndexedAt time.Time
 }
 
 type pageData struct {
-	Albums       []Album
-	Photos       []Photo
-	Items        []gridItem // photos interleaved with month/year section headers
-	PhotosJSON   template.JS
-	ResJSON      template.JS
-	Query        string
-	CurrentAlbum string
-	ActionURL    string
-	Title        string
-	Canonical    string // absolute URL of this page (only when Domain is set)
-	OGTitle      string // Open Graph title (photo-specific for deep links)
-	OGImage      string // Open Graph image (absolute) for a deep-linked photo
+	Tree             *AlbumNode
+	Keywords         []KeywordCount
+	Photos           []Photo
+	Items            []gridItem // photos interleaved with month/year section headers
+	PhotosJSON       template.JS
+	ResJSON          template.JS
+	Query            string
+	CurrentAlbum     string
+	CurrentAlbumName string
+	CurrentTag       string
+	ActionURL        string
+	Title            string
+	Canonical        string // absolute URL of this page (only when Domain is set)
+	OGTitle          string // Open Graph title (photo-specific for deep links)
+	OGImage          string // Open Graph image (absolute) for a deep-linked photo
 }
 
 // gridItem is one entry in the rendered grid: either a section header (Header set)
@@ -184,8 +212,8 @@ func buildGridItems(photos []Photo) []gridItem {
 // escaped path (for building /download URLs), title, and metadata shown in the
 // viewer's info panel. The grid itself renders none of the metadata fields.
 type photoRef struct {
-	U     string   `json:"u"`  // full-size media URL (viewer)
-	Th    string   `json:"th"` // thumbnail URL (filmstrip)
+	U     string   `json:"u"`  // preview URL shown in the viewer (not the full original)
+	Th    string   `json:"th"` // thumbnail URL (grid/filmstrip)
 	P     string   `json:"p"`  // escaped path (for /download URLs)
 	T     string   `json:"t"`
 	Album string   `json:"album,omitempty"`
@@ -234,15 +262,34 @@ func New(cfg Config) (*Gallery, error) {
 		return nil, fmt.Errorf("%s is not a directory", root)
 	}
 
+	downloadSizes := cfg.DownloadSizes
+	if len(downloadSizes) == 0 {
+		downloadSizes = DefaultDownloadSizes
+	}
+
 	g := &Gallery{
 		root:      root,
 		cachePath: cfg.CachePath,
 		thumbDir:  strings.TrimSpace(cfg.ThumbCache),
+		warm:      cfg.WarmCache,
 		title:     title,
 		domain:    strings.TrimRight(strings.TrimSpace(cfg.Domain), "/"),
 		tmpl:      tmpl,
 		indexTmpl: indexTmpl,
 		cache:     map[string]cacheEntry{},
+		thumbV: variant{
+			tag:     "t",
+			maxW:    1 << 20,
+			maxH:    positiveOr(cfg.ThumbHeight, defaultThumbHeight),
+			quality: clampQuality(cfg.ThumbQuality, defaultThumbQuality),
+		},
+		previewV: variant{
+			tag:     "p",
+			maxW:    positiveOr(cfg.PreviewMax, defaultPreviewMax),
+			maxH:    positiveOr(cfg.PreviewMax, defaultPreviewMax),
+			quality: clampQuality(cfg.PreviewQuality, defaultPreviewQuality),
+		},
+		downloadSizes: downloadSizes,
 	}
 	// exiftool gives the most accurate metadata (including Nikon/Canon maker-note
 	// details like lens names) across camera makes and edited/exported files. If the
@@ -253,10 +300,22 @@ func New(cfg Config) (*Gallery, error) {
 		g.et = et
 	}
 
+	// cwebp yields smaller thumbnails/previews at equal quality. Without it,
+	// renditions are encoded as JPEG.
+	if path, err := exec.LookPath("cwebp"); err == nil {
+		g.cwebp = path
+	} else {
+		log.Printf("cwebp not found, thumbnails/previews will be JPEG (install libwebp for smaller WebP): %v", err)
+	}
+
 	if loaded := loadCache(cfg.CachePath); loaded != nil {
 		g.cache = loaded
 		log.Printf("loaded %d cached entries from %s", len(loaded), cfg.CachePath)
 	}
+
+	// Drop renditions left over from a previous size/quality/format configuration.
+	go g.pruneStaleCache()
+
 	go func() {
 		if err := g.Rescan(); err != nil {
 			log.Printf("initial index failed: %v", err)
@@ -446,44 +505,27 @@ func (g *Gallery) Rescan() error {
 		return photos[i].TakenAt.After(photos[j].TakenAt)
 	})
 
-	albums := map[string]*Album{}
-	for _, p := range photos {
-		album := albums[p.AlbumPath]
-		if album == nil {
-			album = &Album{Path: p.AlbumPath, Name: p.AlbumName}
-			albums[p.AlbumPath] = album
-		}
-		album.Count++
-		if album.Cover == "" {
-			album.Cover = p.MediaPath
-		}
-	}
-	albumList := make([]Album, 0, len(albums))
-	for _, album := range albums {
-		albumList = append(albumList, *album)
-	}
-	sort.Slice(albumList, func(i, j int) bool {
-		if albumList[i].Path == "" {
-			return true
-		}
-		if albumList[j].Path == "" {
-			return false
-		}
-		return albumList[i].Name < albumList[j].Name
-	})
+	tree := buildAlbumTree(photos)
+	keywords := buildKeywords(photos)
 
 	g.mu.Lock()
-	g.state = viewModel{Albums: albumList, Photos: photos, IndexedAt: time.Now()}
+	g.state = viewModel{Tree: tree, Keywords: keywords, Photos: photos, IndexedAt: time.Now()}
 	g.cache = newCache
 	g.ready = true
 	g.mu.Unlock()
 
-	log.Printf("indexed %d photos in %d albums (%d new/changed, %d reused) in %s",
-		len(photos), len(albumList), len(toProcess), len(jobs)-len(toProcess), time.Since(start).Round(time.Millisecond))
+	log.Printf("indexed %d photos in %d folders, %d keywords (%d new/changed, %d reused) in %s",
+		len(photos), countFolders(tree), len(keywords), len(toProcess), len(jobs)-len(toProcess), time.Since(start).Round(time.Millisecond))
 
 	// Persist only when the index actually changed, so idle rescans don't rewrite.
 	if len(toProcess) > 0 || len(newCache) != len(prev) {
 		saveCache(g.cachePath, newCache)
+	}
+
+	// Pre-generate thumbnails/previews in the background (opt-in). Skipped renditions
+	// that already exist make this cheap on unchanged rescans.
+	if g.warm {
+		go g.warmCache()
 	}
 	return nil
 }
@@ -524,21 +566,25 @@ func (g *Gallery) render(w http.ResponseWriter, r *http.Request, currentAlbum st
 	}
 
 	query := strings.TrimSpace(r.URL.Query().Get("q"))
-	photos := filterPhotos(state.Photos, currentAlbum, query)
+	tag := strings.TrimSpace(r.URL.Query().Get("tag"))
+	photos := filterPhotos(state.Photos, currentAlbum, query, tag)
 	page := pageData{
-		Albums:       filterAlbums(state.Albums, currentAlbum),
+		Tree:         annotateTree(state.Tree, currentAlbum),
+		Keywords:     state.Keywords,
 		Photos:       photos,
 		Items:        buildGridItems(photos),
 		PhotosJSON:   photosPayload(photos),
-		ResJSON:      resPayload(),
+		ResJSON:      g.resPayload(),
 		Query:        query,
 		CurrentAlbum: currentAlbum,
+		CurrentTag:   tag,
 		ActionURL:    "/",
 		Title:        g.title,
 		OGTitle:      g.title,
 	}
 	if currentAlbum != "" {
 		page.ActionURL = "/albums/" + escapePath(currentAlbum)
+		page.CurrentAlbumName = prettyAlbumName(currentAlbum)
 	}
 
 	// With a configured domain, emit canonical + Open Graph tags. For a
@@ -548,7 +594,7 @@ func (g *Gallery) render(w http.ResponseWriter, r *http.Request, currentAlbum st
 		if photoPath := r.URL.Query().Get("photo"); photoPath != "" {
 			for _, ph := range state.Photos {
 				if ph.MediaPath == photoPath {
-					page.OGImage = g.domain + ph.MediaURL
+					page.OGImage = g.domain + "/preview/" + escapePath(ph.MediaPath)
 					if ph.Title != "" {
 						page.OGTitle = ph.Title + " · " + g.title
 					}
@@ -570,7 +616,7 @@ func photosPayload(photos []Photo) template.JS {
 	refs := make([]photoRef, 0, len(photos))
 	for _, p := range photos {
 		refs = append(refs, photoRef{
-			U:     p.MediaURL,
+			U:     "/preview/" + escapePath(p.MediaPath),
 			Th:    "/thumb/" + escapePath(p.MediaPath),
 			P:     escapePath(p.MediaPath),
 			T:     p.Title,
@@ -588,9 +634,9 @@ func photosPayload(photos []Photo) template.JS {
 }
 
 // resPayload serializes the resolution labels offered in the download menu.
-func resPayload() template.JS {
-	labels := make([]string, 0, len(DownloadSizes))
-	for _, size := range DownloadSizes {
+func (g *Gallery) resPayload() template.JS {
+	labels := make([]string, 0, len(g.downloadSizes))
+	for _, size := range g.downloadSizes {
 		labels = append(labels, size.Label)
 	}
 	data, err := json.Marshal(labels)
@@ -1133,28 +1179,138 @@ func parseXMP(raw []byte) ([]string, string) {
 	return tags, title
 }
 
-func filterAlbums(albums []Album, currentAlbum string) []Album {
-	filtered := make([]Album, len(albums))
-	for i, album := range albums {
-		filtered[i] = album
-		filtered[i].Active = album.Path == currentAlbum
-	}
-	return filtered
-}
-
-func filterPhotos(photos []Photo, currentAlbum, query string) []Photo {
+// filterPhotos selects photos in the current album (and its sub-albums), matching
+// the full-text query, and carrying the exact keyword tag. Empty filters match all.
+func filterPhotos(photos []Photo, currentAlbum, query, tag string) []Photo {
 	query = strings.ToLower(strings.TrimSpace(query))
+	tag = strings.ToLower(strings.TrimSpace(tag))
 	filtered := make([]Photo, 0, len(photos))
 	for _, photo := range photos {
-		if currentAlbum != "" && photo.AlbumPath != currentAlbum {
+		if currentAlbum != "" && photo.AlbumPath != currentAlbum && !strings.HasPrefix(photo.AlbumPath, currentAlbum+"/") {
 			continue
 		}
 		if query != "" && !strings.Contains(photo.searchText, query) {
 			continue
 		}
+		if tag != "" && !photoHasTag(photo, tag) {
+			continue
+		}
 		filtered = append(filtered, photo)
 	}
 	return filtered
+}
+
+func photoHasTag(p Photo, lowerTag string) bool {
+	for _, t := range p.Tags {
+		if strings.ToLower(t) == lowerTag {
+			return true
+		}
+	}
+	return false
+}
+
+// buildAlbumTree builds the folder hierarchy from photo album paths, including
+// intermediate folders that have no direct photos. Each node's Count is the number
+// of photos in its whole subtree.
+func buildAlbumTree(photos []Photo) *AlbumNode {
+	root := &AlbumNode{Path: "", Name: "All photos"}
+	nodes := map[string]*AlbumNode{"": root}
+
+	var ensure func(path string) *AlbumNode
+	ensure = func(path string) *AlbumNode {
+		if n, ok := nodes[path]; ok {
+			return n
+		}
+		parent := ""
+		if i := strings.LastIndex(path, "/"); i >= 0 {
+			parent = path[:i]
+		}
+		n := &AlbumNode{Path: path, Name: prettyAlbumName(path)}
+		nodes[path] = n
+		p := ensure(parent)
+		p.Children = append(p.Children, n)
+		return n
+	}
+
+	for _, ph := range photos {
+		ensure(ph.AlbumPath)
+		for path := ph.AlbumPath; ; {
+			nodes[path].Count++
+			if path == "" {
+				break
+			}
+			if i := strings.LastIndex(path, "/"); i >= 0 {
+				path = path[:i]
+			} else {
+				path = ""
+			}
+		}
+	}
+
+	sortAlbumNodes(root)
+	return root
+}
+
+func sortAlbumNodes(n *AlbumNode) {
+	sort.Slice(n.Children, func(i, j int) bool {
+		return strings.ToLower(n.Children[i].Name) < strings.ToLower(n.Children[j].Name)
+	})
+	for _, c := range n.Children {
+		sortAlbumNodes(c)
+	}
+}
+
+func countFolders(n *AlbumNode) int {
+	total := 0
+	for _, c := range n.Children {
+		total += 1 + countFolders(c)
+	}
+	return total
+}
+
+// annotateTree returns a copy of the tree with Active/Open set relative to the
+// current album, so the branch leading to it renders expanded and highlighted.
+func annotateTree(node *AlbumNode, current string) *AlbumNode {
+	if node == nil {
+		return nil
+	}
+	n := &AlbumNode{
+		Path:   node.Path,
+		Name:   node.Name,
+		Count:  node.Count,
+		Active: node.Path == current,
+		Open:   node.Path == "" || node.Path == current || strings.HasPrefix(current, node.Path+"/"),
+	}
+	for _, c := range node.Children {
+		n.Children = append(n.Children, annotateTree(c, current))
+	}
+	return n
+}
+
+// buildKeywords tallies keyword/tag usage across all photos, most-used first.
+func buildKeywords(photos []Photo) []KeywordCount {
+	counts := map[string]int{}
+	display := map[string]string{}
+	for _, ph := range photos {
+		for _, tag := range ph.Tags {
+			key := strings.ToLower(tag)
+			counts[key]++
+			if _, ok := display[key]; !ok {
+				display[key] = tag
+			}
+		}
+	}
+	out := make([]KeywordCount, 0, len(counts))
+	for key, c := range counts {
+		out = append(out, KeywordCount{Name: display[key], Count: c})
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Count != out[j].Count {
+			return out[i].Count > out[j].Count
+		}
+		return strings.ToLower(out[i].Name) < strings.ToLower(out[j].Name)
+	})
+	return out
 }
 
 func prettyAlbumName(albumPath string) string {
@@ -1276,12 +1432,48 @@ const pageTemplate = `<!doctype html>
       border-radius:999px; padding:8px 14px; font:inherit; outline:none; }
     .search input:focus { border-color:#3a3a42; }
 
-    .albums { display:flex; gap:8px; overflow-x:auto; padding:12px 18px; border-bottom:1px solid var(--line); scrollbar-width:thin; }
-    .chip { flex:0 0 auto; padding:6px 12px; border-radius:999px; border:1px solid var(--line); color:var(--muted);
-      font-size:.85rem; white-space:nowrap; transition:background .15s, color .15s; }
-    .chip:hover { color:var(--fg); }
-    .chip.active { background:var(--hi); color:#0b0b0d; border-color:var(--hi); }
-    .chip em { font-style:normal; opacity:.6; margin-left:6px; }
+    .filters { display:flex; gap:8px; }
+    .dropdown { position:relative; }
+    .dropdown > summary { list-style:none; cursor:pointer; user-select:none; padding:8px 14px; border-radius:999px;
+      border:1px solid var(--line); background:var(--panel); color:var(--fg); font-size:.85rem; white-space:nowrap; }
+    .dropdown > summary::-webkit-details-marker { display:none; }
+    .dropdown > summary::after { content:"▾"; margin-left:8px; color:var(--muted); }
+    .dropdown[open] > summary { border-color:#3a3a42; }
+    .dd-panel { position:absolute; top:calc(100% + 6px); left:0; z-index:30; width:300px; max-width:80vw;
+      max-height:min(70vh,520px); overflow-y:auto; padding:8px; background:#161619; border:1px solid var(--line);
+      border-radius:14px; box-shadow:0 18px 44px rgba(0,0,0,.55); scrollbar-width:thin; }
+    .dd-empty { margin:8px 10px; color:var(--muted); font-size:.85rem; }
+
+    .tree, .tree ul { list-style:none; margin:0; padding:0; }
+    .tree ul { margin-left:14px; border-left:1px solid var(--line); padding-left:6px; }
+    .tree-link { display:flex; align-items:center; gap:8px; padding:6px 10px; border-radius:9px; color:var(--fg);
+      font-size:.88rem; }
+    .tree-link span { flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+    .tree-link em { font-style:normal; color:var(--muted); font-size:.8rem; }
+    .tree-link:hover { background:#22222a; }
+    .tree-link.active { background:var(--hi); color:#0b0b0d; }
+    .tree-link.active em { color:#0b0b0d; opacity:.65; }
+    .tree details > summary { list-style:none; cursor:pointer; display:flex; align-items:center; }
+    .tree details > summary::-webkit-details-marker { display:none; }
+    .tree details > summary::before { content:"▸"; color:var(--muted); width:14px; flex:0 0 auto; font-size:.75rem; }
+    .tree details[open] > summary::before { content:"▾"; }
+    .tree details > summary .tree-link { flex:1; }
+
+    .kw-filter { width:100%; margin-bottom:8px; border:1px solid var(--line); background:var(--bg); color:var(--fg);
+      border-radius:8px; padding:7px 10px; font:inherit; outline:none; }
+    .kw-list { list-style:none; margin:0; padding:0; }
+    .kw-list a { display:flex; align-items:center; gap:8px; padding:6px 10px; border-radius:9px; color:var(--fg); font-size:.88rem; }
+    .kw-list a span { flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+    .kw-list a em { font-style:normal; color:var(--muted); font-size:.8rem; }
+    .kw-list a:hover { background:#22222a; }
+    .kw-list a.active { background:var(--hi); color:#0b0b0d; }
+    .kw-list a.active em { color:#0b0b0d; opacity:.65; }
+
+    .active-filters { display:flex; align-items:center; gap:10px; flex-wrap:wrap; padding:10px 18px;
+      border-bottom:1px solid var(--line); font-size:.85rem; }
+    .active-filters .af { color:var(--muted); }
+    .active-filters .af-clear { color:var(--fg); border:1px solid var(--line); border-radius:999px; padding:3px 12px; }
+    .active-filters .af-clear:hover { background:#22222a; }
 
     .grid { display:flex; flex-wrap:wrap; justify-content:center; gap:1px; padding:1px; align-content:flex-start; }
     .grid-break { flex:0 0 100%; display:flex; align-items:baseline; margin:26px 3px 8px; padding-bottom:8px;
@@ -1342,7 +1534,8 @@ const pageTemplate = `<!doctype html>
     .v-info dt { color:var(--muted); white-space:nowrap; }
     .v-info dd { margin:0; text-align:right; word-break:break-word; }
     .v-info .v-tags { display:flex; flex-wrap:wrap; gap:6px; margin-top:20px; }
-    .v-info .v-tags span { background:#26262b; border-radius:999px; padding:4px 10px; font-size:.78rem; }
+    .v-info .v-tags a { background:#26262b; color:var(--fg); border-radius:999px; padding:4px 10px; font-size:.78rem; cursor:pointer; }
+    .v-info .v-tags a:hover { background:var(--hi); color:#0b0b0d; }
 
     .toast { position:fixed; bottom:24px; left:50%; z-index:70; background:#1b1b1f; color:#fff;
       border:1px solid var(--line); border-radius:10px; padding:10px 16px; font-size:.85rem;
@@ -1361,15 +1554,36 @@ const pageTemplate = `<!doctype html>
 
   <header>
     <h1>{{.Title}}</h1>
+    <nav class="filters">
+      <details class="dropdown" id="dd-folders">
+        <summary>Folders</summary>
+        <div class="dd-panel">
+          <a class="tree-link{{if eq .CurrentAlbum ""}} active{{end}}" href="/"><span>All photos</span><em>{{.Tree.Count}}</em></a>
+          {{if .Tree.Children}}<ul class="tree">{{range .Tree.Children}}{{template "albumNode" .}}{{end}}</ul>{{end}}
+        </div>
+      </details>
+      <details class="dropdown" id="dd-keywords">
+        <summary>Keywords</summary>
+        <div class="dd-panel">
+          <input type="search" class="kw-filter" placeholder="Filter keywords" aria-label="Filter keywords">
+          {{if .Keywords}}<ul class="kw-list">{{range .Keywords}}<li><a class="{{if eq .Name $.CurrentTag}}active{{end}}" href="?tag={{.Name | urlquery}}"><span>{{.Name}}</span><em>{{.Count}}</em></a></li>{{end}}</ul>
+          {{else}}<p class="dd-empty">No keywords found.</p>{{end}}
+        </div>
+      </details>
+    </nav>
     <form class="search" method="get" action="{{.ActionURL}}">
+      {{if .CurrentTag}}<input type="hidden" name="tag" value="{{.CurrentTag}}">{{end}}
       <input type="search" name="q" placeholder="Search" value="{{.Query}}" aria-label="Search photos">
     </form>
   </header>
 
-  <nav class="albums">
-    <a class="chip {{if eq .CurrentAlbum ""}}active{{end}}" href="/">All</a>
-    {{range .Albums}}<a class="chip {{if .Active}}active{{end}}" href="{{albumURL .Path}}">{{.Name}}<em>{{.Count}}</em></a>{{end}}
-  </nav>
+  {{if or .CurrentAlbum .CurrentTag}}
+  <div class="active-filters">
+    {{if .CurrentAlbum}}<span class="af">Folder: {{.CurrentAlbumName}}</span>{{end}}
+    {{if .CurrentTag}}<span class="af">Keyword: {{.CurrentTag}}</span>{{end}}
+    <a class="af-clear" href="/">Clear filters</a>
+  </div>
+  {{end}}
 
   {{if .Photos}}
   <main class="grid" id="grid">
@@ -1500,6 +1714,25 @@ const pageTemplate = `<!doctype html>
       document.body.removeChild(ta);
     }
 
+    // Filter dropdowns: close on outside click / Escape; live-filter the keyword list.
+    var dropdowns = document.querySelectorAll('.dropdown');
+    document.addEventListener('click', function(e){
+      dropdowns.forEach(function(d){ if (d.open && !d.contains(e.target)) d.open = false; });
+    });
+    document.addEventListener('keydown', function(e){
+      if (e.key === 'Escape') dropdowns.forEach(function(d){ d.open = false; });
+    });
+    var kwFilter = document.querySelector('.kw-filter');
+    if (kwFilter) {
+      kwFilter.addEventListener('input', function(){
+        var q = this.value.trim().toLowerCase();
+        this.parentNode.querySelectorAll('.kw-list li').forEach(function(li){
+          li.style.display = li.textContent.toLowerCase().indexOf(q) >= 0 ? '' : 'none';
+        });
+      });
+      kwFilter.addEventListener('click', function(e){ e.stopPropagation(); });
+    }
+
     function el(tag, cls, text){
       var e = document.createElement(tag);
       if (cls) e.className = cls;
@@ -1519,7 +1752,11 @@ const pageTemplate = `<!doctype html>
       }
       if (p.tags && p.tags.length) {
         var tg = el('div', 'v-tags');
-        p.tags.forEach(function(t){ tg.appendChild(el('span', null, t)); });
+        p.tags.forEach(function(t){
+          var a = el('a', null, t);
+          a.href = '?tag=' + encodeURIComponent(t); // click to filter the gallery by this keyword
+          tg.appendChild(a);
+        });
         vInfo.appendChild(tg);
       }
       if (!vInfo.childNodes.length) vInfo.appendChild(el('p', 'v-sub', 'No metadata available'));
@@ -1646,4 +1883,4 @@ const pageTemplate = `<!doctype html>
   </script>
 </body>
 </html>
-`
+{{define "albumNode"}}<li>{{if .Children}}<details{{if .Open}} open{{end}}><summary><a class="tree-link{{if .Active}} active{{end}}" href="{{albumURL .Path}}"><span>{{.Name}}</span><em>{{.Count}}</em></a></summary><ul>{{range .Children}}{{template "albumNode" .}}{{end}}</ul></details>{{else}}<a class="tree-link{{if .Active}} active{{end}}" href="{{albumURL .Path}}"><span>{{.Name}}</span><em>{{.Count}}</em></a>{{end}}</li>{{end}}`

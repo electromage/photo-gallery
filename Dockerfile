@@ -10,9 +10,10 @@ RUN CGO_ENABLED=0 GOOS=linux go build -o /out/photo-gallery .
 FROM alpine:3.22
 WORKDIR /app
 
-# exiftool provides the richest metadata (incl. Nikon/Canon lens names). Without
-# it the app still runs, using a built-in EXIF reader with less coverage.
-RUN apk add --no-cache exiftool
+# exiftool provides the richest metadata (incl. Nikon/Canon lens names); libwebp-tools
+# provides cwebp for smaller WebP thumbnails/previews. Both are optional — without
+# them the app falls back to a built-in EXIF reader and JPEG renditions.
+RUN apk add --no-cache exiftool libwebp-tools
 
 COPY --from=build /out/photo-gallery /app/photo-gallery
 

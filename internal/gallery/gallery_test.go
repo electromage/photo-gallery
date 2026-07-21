@@ -35,11 +35,14 @@ func TestBuildViewModelSortsByExifNewestFirstAndIndexesAlbumsAndTags(t *testing.
 	}
 	vm := waitForIndex(t, g)
 
-	if len(vm.Albums) != 1 {
-		t.Fatalf("expected 1 album, got %d", len(vm.Albums))
+	if got := len(vm.Tree.Children); got != 1 {
+		t.Fatalf("expected 1 top-level folder, got %d", got)
 	}
-	if vm.Albums[0].Path != "summer-trip" {
-		t.Fatalf("expected album path summer-trip, got %q", vm.Albums[0].Path)
+	if vm.Tree.Children[0].Path != "summer-trip" {
+		t.Fatalf("expected folder path summer-trip, got %q", vm.Tree.Children[0].Path)
+	}
+	if vm.Tree.Children[0].Count != 2 {
+		t.Fatalf("expected folder count 2, got %d", vm.Tree.Children[0].Count)
 	}
 	if len(vm.Photos) != 2 {
 		t.Fatalf("expected 2 photos, got %d", len(vm.Photos))
@@ -61,7 +64,7 @@ func TestFilterPhotosMatchesAlbumAndTags(t *testing.T) {
 		{AlbumPath: "winter-hike", AlbumName: "Winter Hike", Title: "Fresh Snow", Tags: []string{"mountain"}, searchText: "fresh snow winter hike mountain"},
 	}
 
-	filtered := filterPhotos(photos, "summer-trip", "sunset")
+	filtered := filterPhotos(photos, "summer-trip", "sunset", "")
 	if len(filtered) != 1 {
 		t.Fatalf("expected 1 filtered photo, got %d", len(filtered))
 	}
@@ -227,7 +230,7 @@ func TestCachePersistsAndReusesAcrossRestart(t *testing.T) {
 	if len(vm.Photos) != 1 {
 		t.Fatalf("expected 1 photo after restart, got %d", len(vm.Photos))
 	}
-	if got := filterPhotos(vm.Photos, "", "sunset"); len(got) != 1 {
+	if got := filterPhotos(vm.Photos, "", "sunset", ""); len(got) != 1 {
 		t.Fatalf("search on cached photo failed; searchText not rebuilt (got %d)", len(got))
 	}
 }

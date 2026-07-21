@@ -164,3 +164,25 @@ func TestApplyOrientationRotates(t *testing.T) {
 		t.Errorf("top pixel not red after rotate; r=%d", r>>8)
 	}
 }
+
+func TestParseDownloadSizes(t *testing.T) {
+	// Empty -> defaults.
+	if got, err := ParseDownloadSizes(""); err != nil || len(got) != len(DefaultDownloadSizes) {
+		t.Fatalf("empty spec: got %v, err %v", got, err)
+	}
+
+	got, err := ParseDownloadSizes("Web:1280x720, Print:6000x4000")
+	if err != nil {
+		t.Fatalf("valid spec errored: %v", err)
+	}
+	want := []DownloadSize{{"Web", 1280, 720}, {"Print", 6000, 4000}}
+	if len(got) != 2 || got[0] != want[0] || got[1] != want[1] {
+		t.Fatalf("parsed = %v, want %v", got, want)
+	}
+
+	for _, bad := range []string{"720p", "720p:1280", "720p:axb", "720p:0x0", ":100x100"} {
+		if _, err := ParseDownloadSizes(bad); err == nil {
+			t.Errorf("expected error for %q", bad)
+		}
+	}
+}
