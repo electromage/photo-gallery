@@ -1,7 +1,8 @@
 [Unit]
 Description=Photo Gallery
-# For full metadata (incl. Nikon/Canon lens names) install exiftool, e.g.
-#   apt install libimage-exiftool-perl
+# Optional tools that improve output when installed:
+#   apt install libimage-exiftool-perl   # richer metadata (incl. Nikon/Canon lenses)
+#   apt install webp                     # cwebp, for smaller WebP thumbnails/previews
 After=network-online.target
 Wants=network-online.target
 

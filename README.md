@@ -12,8 +12,10 @@ it builds a public, browsable archive. Meant as an easy way to get off Flickr.
   full-size original — handy for desktop backgrounds. Images are scaled down
   proportionally (never upscaled) and rotated upright using their EXIF orientation.
 
-It's a single Go binary with no runtime dependencies, so it's easy to run in Docker or
-straight on a server.
+It's a single static Go binary, so it's easy to run in Docker or straight on a server.
+Two optional command-line tools make it better when present — **exiftool** (richer
+metadata) and **cwebp** (smaller WebP images); without them it falls back to a
+built-in EXIF reader and JPEG.
 
 > **Note:** photos are indexed by capture date, title, tags, and camera details read
 > from **JPEG** EXIF/XMP metadata. JPEG (`.jpg` / `.jpeg`) is the supported input format.
@@ -83,8 +85,8 @@ docker compose up -d --build
 
 ## Running without Docker
 
-Requires [Go 1.23+](https://go.dev/dl/), and [ExifTool](https://exiftool.org/) for
-full metadata (optional but recommended — see the note above).
+Requires [Go 1.23+](https://go.dev/dl/). Optionally install **ExifTool** (full
+metadata) and **cwebp** (smaller WebP images) — both recommended; see the notes above.
 
 ```bash
 # Serve ./photos on http://localhost:8080
@@ -132,11 +134,29 @@ Designed to handle large libraries (tens of thousands of photos):
   problems are always non-fatal — the server falls back to a cold index. In Docker,
   mount a writable volume at `/cache` (the default `GALLERY_CACHE` path) to keep it
   across container recreation.
-- **Real thumbnails.** The browsing grid and filmstrip are served small JPEG
-  thumbnails from `/thumb/...` — not the full-size originals — so a page of a large
-  library loads a few MB instead of hundreds. Each thumbnail is generated once
-  (respecting EXIF orientation) and cached on disk under `THUMB_CACHE`; the full-res
-  original is only fetched when you open a photo in the viewer.
+- **Thumbnails and previews.** The grid/filmstrip load small `/thumb/` images and the
+  viewer loads a medium `/preview/` (≤2048px) instead of the multi-megabyte original —
+  so paging through photos is fast. Both are generated once (respecting EXIF
+  orientation) and cached on disk under `THUMB_CACHE`. The full original is only
+  fetched via **Download → Original**.
+- **WebP when available.** If the `cwebp` binary is installed, renditions are encoded
+  as WebP — noticeably smaller than JPEG at the same quality (faster loads, fewer
+  gradient artifacts). Without it they're JPEG. Install with
+  `apt install webp` (Debian/Ubuntu), `apk add libwebp-tools` (Alpine), or
+  `brew install webp` (macOS). The Docker image includes it.
+- **Size/quality changes auto-refresh.** Each cached rendition's filename encodes its
+  size, quality, and format, so changing `THUMB_HEIGHT`, `PREVIEW_MAX`, the quality
+  settings, or the WebP/JPEG choice regenerates just the affected renditions on next
+  request; the now-stale files are pruned at startup (each variant independently — e.g.
+  changing `THUMB_HEIGHT` won't touch previews).
+- **Generation cost & warming.** Renditions are generated **lazily on first request**
+  by default, so **server startup generates nothing**. The one-time cost per photo is
+  a decode + resize (≈0.5s for a 24MP image), paid on first view and cached forever
+  after (~2ms). Set `WARM_CACHE=true` to pre-generate everything in the background
+  after indexing (low priority, one decode per photo for both sizes) so the first
+  browse is instant too. Budget roughly a few hundred MB–several GB of disk for a
+  large library, and expect the warm pass to run for a while in the background on
+  first start (it's incremental — later runs only handle new photos).
 
 Each index pass logs a one-line summary, e.g.
 `indexed 16000 photos in 42 albums (120 new/changed, 15880 reused) in 180ms`.
@@ -156,8 +176,14 @@ layer. Point elsewhere with `GALLERY_ENV_FILE=/path/to/file`.
 | `ADDR` | `:8080` | Address/port to listen on |
 | `GALLERY_REFRESH` | `2m` | How often to rescan for changes (Go duration, e.g. `30s`, `5m`; `0` disables) |
 | `GALLERY_CACHE` | `gallery-cache.gob` | Path to the persisted index cache (`/cache/index.gob` in the Docker image). Set empty to disable persistence |
-| `THUMB_CACHE` | `gallery-thumbs` | Directory for generated thumbnails (`/cache/thumbs` in the Docker image). Set empty to generate them on the fly without caching |
-| `GALLERY_ENV_FILE` | `.env` | Path to the env file to load at startup |
+| `THUMB_CACHE` | `gallery-thumbs` | Directory for generated thumbnails and previews (`/cache/thumbs` in the Docker image). Set empty to generate them on the fly without caching |
+| `WARM_CACHE` | `false` | Pre-generate all thumbnails/previews in the background after indexing, so the first browse is instant (costs CPU + disk up front — see below) |
+| `THUMB_HEIGHT` | `512` | Thumbnail max height in px (grid + filmstrip) |
+| `THUMB_QUALITY` | `82` | Thumbnail JPEG/WebP quality (1–100) |
+| `PREVIEW_MAX` | `2048` | Preview max longest edge in px (fullscreen viewer image) |
+| `PREVIEW_QUALITY` | `85` | Preview JPEG/WebP quality (1–100) |
+| `DOWNLOAD_SIZES` | `720p:1280x720,1080p:…` | Download presets as `label:WxH` pairs, comma-separated. "Original" is always also offered |
+| `GALLERY_ENV_FILE` | `.env` | Path to the env file to load at startup (must be a real env var, not set in `.env`) |
 
 ## Endpoints
 
@@ -165,7 +191,8 @@ layer. Point elsewhere with `GALLERY_ENV_FILE=/path/to/file`.
 |---|---|
 | `GET /` | Main feed (all photos, newest first). `?q=` filters by album/title/tags. |
 | `GET /albums/{album}` | A single album's photos. `?q=` filters within it. |
-| `GET /media/{path}` | Serves the original image file (used by the viewer). |
-| `GET /thumb/{path}` | Serves a small cached JPEG thumbnail (used by the grid/filmstrip). |
+| `GET /media/{path}` | Serves the original image file. |
+| `GET /thumb/{path}` | Small cached JPEG thumbnail (used by the grid/filmstrip). |
+| `GET /preview/{path}` | Medium cached JPEG (≤2048px) shown in the viewer instead of the original. |
 | `GET /download/{path}?res=1080p` | Download resized to `720p`, `1080p`, `1440p`, `4k`, or `original`. |
 | `GET /healthz` | Health check; returns `ok`. |

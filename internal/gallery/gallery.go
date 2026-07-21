@@ -17,6 +17,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"runtime"
@@ -47,20 +48,33 @@ var (
 type Config struct {
 	PhotoRoot  string // directory to index and serve
 	CachePath  string // on-disk index cache; "" disables persistence
-	ThumbCache string // directory for generated thumbnails; "" generates on the fly (no caching)
+	ThumbCache string // directory for generated thumbnails/previews; "" generates on the fly (no caching)
+	WarmCache  bool   // pre-generate thumbnails/previews in the background after indexing
 	Title      string // site title (page <title> and header); defaults to "Photo Gallery"
 	Domain     string // public base URL, e.g. https://photos.example.com; enables canonical/OG tags
+
+	ThumbHeight    int            // thumbnail max height in px (0 = default)
+	ThumbQuality   int            // thumbnail JPEG/WebP quality 1-100 (0 = default)
+	PreviewMax     int            // preview max longest edge in px (0 = default)
+	PreviewQuality int            // preview JPEG/WebP quality 1-100 (0 = default)
+	DownloadSizes  []DownloadSize // download resolution presets (nil = default)
 }
 
 type Gallery struct {
 	root      string
 	cachePath string // on-disk index cache; "" disables persistence
-	thumbDir  string // thumbnail cache directory; "" disables caching
+	thumbDir  string // thumbnail/preview cache directory; "" disables caching
+	warm      bool   // pre-generate renditions in the background
+	cwebp     string // path to the cwebp binary; "" encodes renditions as JPEG
 	title     string
 	domain    string
-	tmpl      *template.Template
-	indexTmpl *template.Template
-	et        *exiftool.Exiftool // nil when the exiftool binary is unavailable
+
+	thumbV        variant
+	previewV      variant
+	downloadSizes []DownloadSize
+	tmpl          *template.Template
+	indexTmpl     *template.Template
+	et            *exiftool.Exiftool // nil when the exiftool binary is unavailable
 
 	mu    sync.RWMutex
 	state viewModel
@@ -68,6 +82,7 @@ type Gallery struct {
 	cache map[string]cacheEntry // key: MediaPath; lets rescans skip unchanged files
 
 	rescanMu sync.Mutex // serializes rescans so overlapping ticks are skipped
+	warmMu   sync.Mutex // ensures only one cache-warm pass runs at a time
 }
 
 // cacheEntry remembers a processed photo along with the file stats used to decide
@@ -184,8 +199,8 @@ func buildGridItems(photos []Photo) []gridItem {
 // escaped path (for building /download URLs), title, and metadata shown in the
 // viewer's info panel. The grid itself renders none of the metadata fields.
 type photoRef struct {
-	U     string   `json:"u"`  // full-size media URL (viewer)
-	Th    string   `json:"th"` // thumbnail URL (filmstrip)
+	U     string   `json:"u"`  // preview URL shown in the viewer (not the full original)
+	Th    string   `json:"th"` // thumbnail URL (grid/filmstrip)
 	P     string   `json:"p"`  // escaped path (for /download URLs)
 	T     string   `json:"t"`
 	Album string   `json:"album,omitempty"`
@@ -234,15 +249,34 @@ func New(cfg Config) (*Gallery, error) {
 		return nil, fmt.Errorf("%s is not a directory", root)
 	}
 
+	downloadSizes := cfg.DownloadSizes
+	if len(downloadSizes) == 0 {
+		downloadSizes = DefaultDownloadSizes
+	}
+
 	g := &Gallery{
 		root:      root,
 		cachePath: cfg.CachePath,
 		thumbDir:  strings.TrimSpace(cfg.ThumbCache),
+		warm:      cfg.WarmCache,
 		title:     title,
 		domain:    strings.TrimRight(strings.TrimSpace(cfg.Domain), "/"),
 		tmpl:      tmpl,
 		indexTmpl: indexTmpl,
 		cache:     map[string]cacheEntry{},
+		thumbV: variant{
+			tag:     "t",
+			maxW:    1 << 20,
+			maxH:    positiveOr(cfg.ThumbHeight, defaultThumbHeight),
+			quality: clampQuality(cfg.ThumbQuality, defaultThumbQuality),
+		},
+		previewV: variant{
+			tag:     "p",
+			maxW:    positiveOr(cfg.PreviewMax, defaultPreviewMax),
+			maxH:    positiveOr(cfg.PreviewMax, defaultPreviewMax),
+			quality: clampQuality(cfg.PreviewQuality, defaultPreviewQuality),
+		},
+		downloadSizes: downloadSizes,
 	}
 	// exiftool gives the most accurate metadata (including Nikon/Canon maker-note
 	// details like lens names) across camera makes and edited/exported files. If the
@@ -253,10 +287,22 @@ func New(cfg Config) (*Gallery, error) {
 		g.et = et
 	}
 
+	// cwebp yields smaller thumbnails/previews at equal quality. Without it,
+	// renditions are encoded as JPEG.
+	if path, err := exec.LookPath("cwebp"); err == nil {
+		g.cwebp = path
+	} else {
+		log.Printf("cwebp not found, thumbnails/previews will be JPEG (install libwebp for smaller WebP): %v", err)
+	}
+
 	if loaded := loadCache(cfg.CachePath); loaded != nil {
 		g.cache = loaded
 		log.Printf("loaded %d cached entries from %s", len(loaded), cfg.CachePath)
 	}
+
+	// Drop renditions left over from a previous size/quality/format configuration.
+	go g.pruneStaleCache()
+
 	go func() {
 		if err := g.Rescan(); err != nil {
 			log.Printf("initial index failed: %v", err)
@@ -485,6 +531,12 @@ func (g *Gallery) Rescan() error {
 	if len(toProcess) > 0 || len(newCache) != len(prev) {
 		saveCache(g.cachePath, newCache)
 	}
+
+	// Pre-generate thumbnails/previews in the background (opt-in). Skipped renditions
+	// that already exist make this cheap on unchanged rescans.
+	if g.warm {
+		go g.warmCache()
+	}
 	return nil
 }
 
@@ -530,7 +582,7 @@ func (g *Gallery) render(w http.ResponseWriter, r *http.Request, currentAlbum st
 		Photos:       photos,
 		Items:        buildGridItems(photos),
 		PhotosJSON:   photosPayload(photos),
-		ResJSON:      resPayload(),
+		ResJSON:      g.resPayload(),
 		Query:        query,
 		CurrentAlbum: currentAlbum,
 		ActionURL:    "/",
@@ -548,7 +600,7 @@ func (g *Gallery) render(w http.ResponseWriter, r *http.Request, currentAlbum st
 		if photoPath := r.URL.Query().Get("photo"); photoPath != "" {
 			for _, ph := range state.Photos {
 				if ph.MediaPath == photoPath {
-					page.OGImage = g.domain + ph.MediaURL
+					page.OGImage = g.domain + "/preview/" + escapePath(ph.MediaPath)
 					if ph.Title != "" {
 						page.OGTitle = ph.Title + " · " + g.title
 					}
@@ -570,7 +622,7 @@ func photosPayload(photos []Photo) template.JS {
 	refs := make([]photoRef, 0, len(photos))
 	for _, p := range photos {
 		refs = append(refs, photoRef{
-			U:     p.MediaURL,
+			U:     "/preview/" + escapePath(p.MediaPath),
 			Th:    "/thumb/" + escapePath(p.MediaPath),
 			P:     escapePath(p.MediaPath),
 			T:     p.Title,
@@ -588,9 +640,9 @@ func photosPayload(photos []Photo) template.JS {
 }
 
 // resPayload serializes the resolution labels offered in the download menu.
-func resPayload() template.JS {
-	labels := make([]string, 0, len(DownloadSizes))
-	for _, size := range DownloadSizes {
+func (g *Gallery) resPayload() template.JS {
+	labels := make([]string, 0, len(g.downloadSizes))
+	for _, size := range g.downloadSizes {
 		labels = append(labels, size.Label)
 	}
 	data, err := json.Marshal(labels)

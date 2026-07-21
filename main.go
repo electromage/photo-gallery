@@ -5,6 +5,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -22,12 +23,24 @@ func main() {
 	thumbCache := getenv("THUMB_CACHE", "gallery-thumbs")
 	refreshInterval := durationEnv("GALLERY_REFRESH", 2*time.Minute)
 
+	downloadSizes, err := gallery.ParseDownloadSizes(getenv("DOWNLOAD_SIZES", ""))
+	if err != nil {
+		log.Printf("invalid DOWNLOAD_SIZES, using defaults: %v", err)
+		downloadSizes = nil
+	}
+
 	app, err := gallery.New(gallery.Config{
-		PhotoRoot:  photoRoot,
-		CachePath:  cachePath,
-		ThumbCache: thumbCache,
-		Title:      getenv("SITE_TITLE", "Photo Gallery"),
-		Domain:     getenv("SITE_DOMAIN", ""),
+		PhotoRoot:      photoRoot,
+		CachePath:      cachePath,
+		ThumbCache:     thumbCache,
+		WarmCache:      boolEnv("WARM_CACHE", false),
+		Title:          getenv("SITE_TITLE", "Photo Gallery"),
+		Domain:         getenv("SITE_DOMAIN", ""),
+		ThumbHeight:    intEnv("THUMB_HEIGHT", 0),
+		ThumbQuality:   intEnv("THUMB_QUALITY", 0),
+		PreviewMax:     intEnv("PREVIEW_MAX", 0),
+		PreviewQuality: intEnv("PREVIEW_QUALITY", 0),
+		DownloadSizes:  downloadSizes,
 	})
 	if err != nil {
 		log.Fatalf("unable to index photos: %v", err)
@@ -48,6 +61,7 @@ func main() {
 	mux := http.NewServeMux()
 	mux.Handle("/media/", http.StripPrefix("/media/", http.FileServer(http.FS(os.DirFS(photoRoot)))))
 	mux.HandleFunc("/thumb/", app.HandleThumb)
+	mux.HandleFunc("/preview/", app.HandlePreview)
 	mux.HandleFunc("/download/", app.HandleDownload)
 	mux.HandleFunc("/albums/", app.HandleAlbum)
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
@@ -99,6 +113,29 @@ func loadDotEnv(path string) {
 			continue // real environment wins
 		}
 		os.Setenv(key, unquote(strings.TrimSpace(line[eq+1:])))
+	}
+}
+
+// intEnv reads an integer environment variable, falling back on empty/invalid input.
+func intEnv(key string, fallback int) int {
+	if v := strings.TrimSpace(os.Getenv(key)); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			return n
+		}
+		log.Printf("invalid %s value %q, using default", key, v)
+	}
+	return fallback
+}
+
+// boolEnv reads a boolean environment variable (1/true/yes/on, case-insensitive).
+func boolEnv(key string, fallback bool) bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv(key))) {
+	case "1", "true", "yes", "on":
+		return true
+	case "0", "false", "no", "off":
+		return false
+	default:
+		return fallback
 	}
 }
 

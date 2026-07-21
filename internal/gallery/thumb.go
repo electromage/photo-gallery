@@ -4,24 +4,125 @@ import (
 	"bytes"
 	"crypto/sha1"
 	"encoding/hex"
+	"fmt"
+	"image"
 	"image/jpeg"
+	"image/png"
+	"log"
 	"net/http"
 	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 )
 
-// thumbHeight is the max height of a generated grid/filmstrip thumbnail. Sized to
-// stay crisp on high-DPI displays at the grid's ~320px render height while keeping
-// files small (tens of KB) so a large library loads quickly.
-const thumbHeight = 512
+// variant is a cached, resized rendition of a photo. Two are served: a small
+// thumbnail for the browsing grid/filmstrip, and a larger preview for the viewer
+// (so paging through photos doesn't download the multi-megabyte originals).
+type variant struct {
+	tag     string // cache-file prefix, keeps variants from colliding
+	maxW    int
+	maxH    int
+	quality int
+}
 
-// HandleThumb serves a small JPEG thumbnail of a photo, generated once and cached
-// on disk. Unlike /media (which serves the full original), this keeps the browsing
-// grid lightweight.
+// Defaults used when the corresponding env vars are unset. The thumbnail is
+// height-bound (the grid lays out fixed-height rows); the preview is bound by its
+// longest edge — big enough for full-screen viewing but a fraction of the original.
+const (
+	defaultThumbHeight    = 512
+	defaultThumbQuality   = 82
+	defaultPreviewMax     = 2048
+	defaultPreviewQuality = 85
+)
+
+// clampQuality keeps a JPEG/WebP quality within 1-100, applying def for non-positive.
+func clampQuality(q, def int) int {
+	if q <= 0 {
+		return def
+	}
+	if q > 100 {
+		return 100
+	}
+	return q
+}
+
+// positiveOr returns v when positive, otherwise def.
+func positiveOr(v, def int) int {
+	if v > 0 {
+		return v
+	}
+	return def
+}
+
+func (v variant) cacheName(relSlash, ext string) string {
+	sum := sha1.Sum([]byte(relSlash))
+	return v.tag + "_" + hex.EncodeToString(sum[:]) + "_" + v.sig() + "." + ext
+}
+
+// sig is a short signature of the variant's resize parameters, embedded in cache
+// filenames so that changing the size or quality invalidates old renditions (a
+// changed sig produces a new filename, missing the cache).
+func (v variant) sig() string {
+	sum := sha1.Sum([]byte(fmt.Sprintf("%d:%d:%d", v.maxW, v.maxH, v.quality)))
+	return hex.EncodeToString(sum[:4])
+}
+
+// pruneStaleCache removes cached renditions whose variant signature or format no
+// longer matches the current config, so changing THUMB_HEIGHT / PREVIEW_MAX /
+// quality (or switching WebP/JPEG) frees the old files instead of orphaning them.
+func (g *Gallery) pruneStaleCache() {
+	if g.thumbDir == "" {
+		return
+	}
+	ext := g.imageExt()
+	thumbSuffix := "_" + g.thumbV.sig() + "." + ext
+	previewSuffix := "_" + g.previewV.sig() + "." + ext
+
+	entries, err := os.ReadDir(g.thumbDir)
+	if err != nil {
+		return
+	}
+	removed := 0
+	for _, e := range entries {
+		name := e.Name()
+		if e.IsDir() || strings.HasSuffix(name, ".tmp") {
+			continue
+		}
+		var want string
+		switch {
+		case strings.HasPrefix(name, "t_"):
+			want = thumbSuffix
+		case strings.HasPrefix(name, "p_"):
+			want = previewSuffix
+		default:
+			continue
+		}
+		if !strings.HasSuffix(name, want) {
+			if os.Remove(filepath.Join(g.thumbDir, name)) == nil {
+				removed++
+			}
+		}
+	}
+	if removed > 0 {
+		log.Printf("pruned %d stale cached renditions", removed)
+	}
+}
+
+// HandleThumb serves a small thumbnail (grid/filmstrip).
 func (g *Gallery) HandleThumb(w http.ResponseWriter, r *http.Request) {
-	rel := strings.TrimPrefix(r.URL.Path, "/thumb/")
+	g.serveVariant(w, r, "/thumb/", g.thumbV)
+}
+
+// HandlePreview serves a larger preview for the viewer.
+func (g *Gallery) HandlePreview(w http.ResponseWriter, r *http.Request) {
+	g.serveVariant(w, r, "/preview/", g.previewV)
+}
+
+func (g *Gallery) serveVariant(w http.ResponseWriter, r *http.Request, prefix string, v variant) {
+	rel := strings.TrimPrefix(r.URL.Path, prefix)
 	if unescaped, err := url.PathUnescape(rel); err == nil {
 		rel = unescaped
 	}
@@ -39,51 +140,92 @@ func (g *Gallery) HandleThumb(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Cache-Control", "public, max-age=604800") // 7 days
 
-	// Serve from the disk cache when a fresh thumbnail already exists.
+	// Serve from the disk cache when a fresh rendition (in the current format)
+	// already exists.
 	if g.thumbDir != "" {
-		cached := filepath.Join(g.thumbDir, thumbKey(relSlash))
+		ext := g.imageExt()
+		cached := filepath.Join(g.thumbDir, v.cacheName(relSlash, ext))
 		if ci, err := os.Stat(cached); err == nil && !ci.ModTime().Before(info.ModTime()) {
+			w.Header().Set("Content-Type", contentTypeForExt(ext))
 			http.ServeFile(w, r, cached)
 			return
 		}
 	}
 
-	data, err := renderThumb(abs, g.photoOrient(relSlash))
+	img, err := loadImageOriented(abs, g.photoOrient(relSlash))
 	if err != nil {
-		http.Error(w, "could not render thumbnail", http.StatusInternalServerError)
+		http.Error(w, "could not read image", http.StatusInternalServerError)
+		return
+	}
+	data, ext, err := g.encodeImage(fitInside(img, v.maxW, v.maxH), v.quality)
+	if err != nil {
+		http.Error(w, "could not render image", http.StatusInternalServerError)
 		return
 	}
 	if g.thumbDir != "" {
-		writeThumbCache(g.thumbDir, thumbKey(relSlash), data)
+		writeCacheFile(g.thumbDir, v.cacheName(relSlash, ext), data)
 	}
 
-	w.Header().Set("Content-Type", "image/jpeg")
+	w.Header().Set("Content-Type", contentTypeForExt(ext))
 	_, _ = w.Write(data)
 }
 
-// renderThumb decodes a photo, applies the given EXIF orientation, scales it down
-// to thumbHeight (never up), and encodes it as JPEG.
-func renderThumb(absPath string, orient int) ([]byte, error) {
-	img, err := loadImageOriented(absPath, orient)
-	if err != nil {
-		return nil, err
+// imageExt is the file extension/format used for generated renditions.
+func (g *Gallery) imageExt() string {
+	if g.cwebp != "" {
+		return "webp"
 	}
-	small := fitInside(img, 1<<20, thumbHeight)
+	return "jpg"
+}
+
+func contentTypeForExt(ext string) string {
+	if ext == "webp" {
+		return "image/webp"
+	}
+	return "image/jpeg"
+}
+
+// encodeImage encodes img as WebP when cwebp is available (smaller at equal
+// quality), otherwise JPEG. Returns the bytes and the format extension used.
+func (g *Gallery) encodeImage(img image.Image, quality int) ([]byte, string, error) {
+	if g.cwebp != "" {
+		if data, err := encodeWebP(g.cwebp, img, quality); err == nil {
+			return data, "webp", nil
+		} else {
+			log.Printf("webp encode failed, falling back to JPEG: %v", err)
+		}
+	}
 	var buf bytes.Buffer
-	if err := jpeg.Encode(&buf, small, &jpeg.Options{Quality: 82}); err != nil {
+	if err := jpeg.Encode(&buf, img, &jpeg.Options{Quality: quality}); err != nil {
+		return nil, "", err
+	}
+	return buf.Bytes(), "jpg", nil
+}
+
+// encodeWebP pipes a lossless PNG of img through cwebp and returns the WebP bytes.
+func encodeWebP(cwebpPath string, img image.Image, quality int) ([]byte, error) {
+	var in bytes.Buffer
+	if err := png.Encode(&in, img); err != nil {
 		return nil, err
 	}
-	return buf.Bytes(), nil
+	// "-o -" writes to stdout; "-- -" reads the PNG from stdin.
+	cmd := exec.Command(cwebpPath, "-quiet", "-q", strconv.Itoa(quality), "-o", "-", "--", "-")
+	cmd.Stdin = &in
+	var out, stderr bytes.Buffer
+	cmd.Stdout = &out
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		return nil, fmt.Errorf("cwebp: %w (%s)", err, strings.TrimSpace(stderr.String()))
+	}
+	if out.Len() == 0 {
+		return nil, fmt.Errorf("cwebp produced no output")
+	}
+	return out.Bytes(), nil
 }
 
-func thumbKey(relSlash string) string {
-	sum := sha1.Sum([]byte(relSlash))
-	return hex.EncodeToString(sum[:]) + ".jpg"
-}
-
-// writeThumbCache atomically writes a thumbnail into the cache dir. Best-effort:
-// any failure is ignored (the thumbnail was already served from memory).
-func writeThumbCache(dir, name string, data []byte) {
+// writeCacheFile atomically writes a rendition into the cache dir. Best-effort:
+// any failure is ignored (the image was already served from memory).
+func writeCacheFile(dir, name string, data []byte) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return
 	}

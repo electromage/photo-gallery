@@ -9,34 +9,72 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 )
 
-// downloadSize is a named target that a photo can be downscaled to before
+// DownloadSize is a named target that a photo can be downscaled to before
 // download. Width/Height are the bounding box; images are scaled to fit inside
 // it proportionally and are never enlarged.
-type downloadSize struct {
+type DownloadSize struct {
 	Label  string
 	Width  int
 	Height int
 }
 
-// DownloadSizes are the resolutions offered in the UI, in display order.
+// DefaultDownloadSizes are the resolutions offered when DOWNLOAD_SIZES is unset.
 // "original" is handled separately (served untouched) and is not listed here.
-var DownloadSizes = []downloadSize{
+var DefaultDownloadSizes = []DownloadSize{
 	{Label: "720p", Width: 1280, Height: 720},
 	{Label: "1080p", Width: 1920, Height: 1080},
 	{Label: "1440p", Width: 2560, Height: 1440},
 	{Label: "4k", Width: 3840, Height: 2160},
 }
 
-func downloadSizeByLabel(label string) (downloadSize, bool) {
-	for _, size := range DownloadSizes {
+// ParseDownloadSizes parses a spec like "720p:1280x720,1080p:1920x1080" into sizes.
+// An empty spec yields the defaults; malformed input returns an error so the caller
+// can fall back.
+func ParseDownloadSizes(spec string) ([]DownloadSize, error) {
+	spec = strings.TrimSpace(spec)
+	if spec == "" {
+		return DefaultDownloadSizes, nil
+	}
+	var out []DownloadSize
+	for _, part := range strings.Split(spec, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		colon := strings.LastIndex(part, ":")
+		if colon < 0 {
+			return nil, fmt.Errorf("bad size %q (want label:WxH)", part)
+		}
+		label := strings.TrimSpace(part[:colon])
+		dims := strings.TrimSpace(part[colon+1:])
+		x := strings.IndexAny(dims, "xX")
+		if label == "" || x < 0 {
+			return nil, fmt.Errorf("bad size %q (want label:WxH)", part)
+		}
+		w, err1 := strconv.Atoi(strings.TrimSpace(dims[:x]))
+		h, err2 := strconv.Atoi(strings.TrimSpace(dims[x+1:]))
+		if err1 != nil || err2 != nil || w <= 0 || h <= 0 {
+			return nil, fmt.Errorf("bad dimensions in %q", part)
+		}
+		out = append(out, DownloadSize{Label: label, Width: w, Height: h})
+	}
+	if len(out) == 0 {
+		return nil, fmt.Errorf("no sizes parsed from %q", spec)
+	}
+	return out, nil
+}
+
+func (g *Gallery) downloadSizeByLabel(label string) (DownloadSize, bool) {
+	for _, size := range g.downloadSizes {
 		if size.Label == label {
 			return size, true
 		}
 	}
-	return downloadSize{}, false
+	return DownloadSize{}, false
 }
 
 // HandleDownload serves a photo for download, optionally resized to a named
@@ -64,7 +102,7 @@ func (g *Gallery) HandleDownload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	size, known := downloadSizeByLabel(res)
+	size, known := g.downloadSizeByLabel(res)
 	if !known {
 		http.Error(w, "unknown resolution", http.StatusBadRequest)
 		return
