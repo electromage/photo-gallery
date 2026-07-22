@@ -217,6 +217,7 @@ type photoRef struct {
 	P     string   `json:"p"`  // escaped path (for /download URLs)
 	T     string   `json:"t"`
 	Album string   `json:"album,omitempty"`
+	AU    string   `json:"au,omitempty"` // album URL (jump to the folder this photo belongs to)
 	Date  string   `json:"date,omitempty"`
 	Tags  []string `json:"tags,omitempty"`
 	Info  []exifKV `json:"info,omitempty"`
@@ -227,12 +228,7 @@ type photoRef struct {
 // unchanged files. Cache problems never prevent the server from running.
 func New(cfg Config) (*Gallery, error) {
 	tmpl, err := template.New("gallery").Funcs(template.FuncMap{
-		"albumURL": func(path string) string {
-			if path == "" {
-				return "/"
-			}
-			return "/albums/" + escapePath(path)
-		},
+		"albumURL": albumURL,
 		"thumbURL": func(mediaPath string) string {
 			return "/thumb/" + escapePath(mediaPath)
 		},
@@ -621,6 +617,7 @@ func photosPayload(photos []Photo) template.JS {
 			P:     escapePath(p.MediaPath),
 			T:     p.Title,
 			Album: p.AlbumName,
+			AU:    albumURL(p.AlbumPath),
 			Date:  p.TakenAtUTC,
 			Tags:  p.Tags,
 			Info:  p.Info,
@@ -1323,6 +1320,14 @@ func prettyAlbumName(albumPath string) string {
 	return titleWords(base)
 }
 
+// albumURL is the gallery URL for an album path ("" is the root feed).
+func albumURL(path string) string {
+	if path == "" {
+		return "/"
+	}
+	return "/albums/" + escapePath(path)
+}
+
 func escapePath(path string) string {
 	parts := strings.Split(path, "/")
 	for i, part := range parts {
@@ -1517,7 +1522,13 @@ const pageTemplate = `<!doctype html>
       background:rgba(255,255,255,.06); color:#fff; font-size:2rem; line-height:1; z-index:2; }
     .v-nav:hover { background:rgba(255,255,255,.16); }
     .v-prev { left:12px; } .v-next { right:12px; }
-    .v-count { position:absolute; top:22px; left:20px; color:var(--muted); font-size:.85rem; z-index:2; }
+    .v-crumb { position:absolute; top:14px; left:16px; z-index:4; display:inline-flex; align-items:center; gap:7px;
+      max-width:min(52vw,380px); padding:8px 14px; border-radius:999px; background:rgba(255,255,255,.08); color:#fff;
+      font-size:.85rem; line-height:1; text-decoration:none; white-space:nowrap; overflow:hidden; }
+    .v-crumb:hover { background:rgba(255,255,255,.18); }
+    .v-crumb .ic { width:15px; height:15px; flex:0 0 auto; opacity:.85; }
+    .v-crumb span { overflow:hidden; text-overflow:ellipsis; }
+    .v-count { position:absolute; top:56px; left:22px; color:var(--muted); font-size:.85rem; z-index:2; }
 
     .filmstrip { flex:0 0 auto; display:flex; gap:6px; overflow-x:auto; padding:10px 12px; background:rgba(0,0,0,.35);
       border-top:1px solid var(--line); scrollbar-width:thin; }
@@ -1551,12 +1562,13 @@ const pageTemplate = `<!doctype html>
       .grid { padding:4% 4%; }
       .tile { height:200px; }
       .v-nav { width:40px; height:56px; font-size:1.5rem; }
+      .v-crumb { max-width:44vw; padding:7px 12px; }
     }
   </style>
 </head>
 <body>
   <div id="ambient"></div>
-  <svg width="0" height="0" aria-hidden="true" style="position:absolute"><symbol id="ic-dl" viewBox="0 0 24 24"><path d="M12 3v11m0 0l-4-4m4 4l4-4M5 20h14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></symbol><symbol id="ic-info" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9" fill="none" stroke="currentColor" stroke-width="2"/><path d="M12 11v5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><circle cx="12" cy="7.6" r="1.15" fill="currentColor"/></symbol><symbol id="ic-link" viewBox="0 0 24 24"><path d="M9 15l6-6M10.5 6.5l1-1a4 4 0 015.9 5.9l-2 2M13.5 17.5l-1 1a4 4 0 01-5.9-5.9l2-2" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></symbol></svg>
+  <svg width="0" height="0" aria-hidden="true" style="position:absolute"><symbol id="ic-dl" viewBox="0 0 24 24"><path d="M12 3v11m0 0l-4-4m4 4l4-4M5 20h14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></symbol><symbol id="ic-info" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9" fill="none" stroke="currentColor" stroke-width="2"/><path d="M12 11v5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><circle cx="12" cy="7.6" r="1.15" fill="currentColor"/></symbol><symbol id="ic-link" viewBox="0 0 24 24"><path d="M9 15l6-6M10.5 6.5l1-1a4 4 0 015.9 5.9l-2 2M13.5 17.5l-1 1a4 4 0 01-5.9-5.9l2-2" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></symbol><symbol id="ic-folder" viewBox="0 0 24 24"><path d="M3 6.5a1.5 1.5 0 011.5-1.5h4l2 2.2h8A1.5 1.5 0 0120 8.7v9.3a1 1 0 01-1 1H4a1 1 0 01-1-1z" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/></symbol></svg>
 
   <header>
     <h1>{{.Title}}</h1>
@@ -1603,6 +1615,7 @@ const pageTemplate = `<!doctype html>
 
   <div class="viewer" id="viewer" hidden>
     <div class="v-content">
+      <a class="v-crumb" id="v-crumb" title="Go to this album"><svg class="ic"><use href="#ic-folder"></use></svg><span id="v-crumb-label"></span></a>
       <div class="v-count" id="v-count"></div>
       <div class="v-bar">
         <button class="v-btn" id="v-link" aria-label="Copy link to this photo"><svg class="ic" style="width:20px;height:20px"><use href="#ic-link"></use></svg></button>
@@ -1639,6 +1652,8 @@ const pageTemplate = `<!doctype html>
     var menu = document.getElementById('menu');
     var vInfo = document.getElementById('v-info-body');
     var infoBtn = document.getElementById('v-info-btn');
+    var crumb = document.getElementById('v-crumb');
+    var crumbLabel = document.getElementById('v-crumb-label');
     var cur = -1;
 
     // Justified rows: pack tiles left-to-right into rows scaled to a target height,
@@ -1805,6 +1820,8 @@ const pageTemplate = `<!doctype html>
       vImg.src = PHOTOS[i].u;
       vImg.alt = PHOTOS[i].t || '';
       vCount.textContent = (i + 1) + ' / ' + PHOTOS.length;
+      crumbLabel.textContent = PHOTOS[i].album || 'Library';
+      crumb.href = PHOTOS[i].au || '/';
       [i - 1, i + 1].forEach(function(j){ if (j >= 0 && j < PHOTOS.length) { var im = new Image(); im.src = PHOTOS[j].u; } });
       var thumbs = strip.children;
       for (var k = 0; k < thumbs.length; k++) thumbs[k].classList.toggle('active', k === i);
