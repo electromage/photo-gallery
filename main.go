@@ -2,11 +2,16 @@ package main
 
 import (
 	"bufio"
+	"context"
+	"errors"
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
 	"strconv"
 	"strings"
+	"syscall"
+	"sync"
 	"time"
 
 	"github.com/electromage/photo-gallery/internal/gallery"
@@ -46,13 +51,25 @@ func main() {
 		log.Fatalf("unable to index photos: %v", err)
 	}
 
+	var (
+		rescanWG   sync.WaitGroup
+		stopRescan chan struct{}
+	)
 	if refreshInterval > 0 {
+		stopRescan = make(chan struct{})
+		rescanWG.Add(1)
 		go func() {
+			defer rescanWG.Done()
 			ticker := time.NewTicker(refreshInterval)
 			defer ticker.Stop()
-			for range ticker.C {
-				if err := app.Rescan(); err != nil {
-					log.Printf("background rescan failed: %v", err)
+			for {
+				select {
+				case <-ticker.C:
+					if err := app.Rescan(); err != nil {
+						log.Printf("background rescan failed: %v", err)
+					}
+				case <-stopRescan:
+					return
 				}
 			}
 		}()
@@ -70,9 +87,56 @@ func main() {
 	})
 	mux.HandleFunc("/", app.HandleIndex)
 
-	log.Printf("photo gallery listening on %s and serving %s", addr, photoRoot)
-	if err := http.ListenAndServe(addr, mux); err != nil {
-		log.Fatal(err)
+	server := newHTTPServer(addr, mux)
+	serverErr := make(chan error, 1)
+	go func() {
+		log.Printf("photo gallery listening on %s and serving %s", addr, photoRoot)
+		serverErr <- server.ListenAndServe()
+	}()
+
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+	defer signal.Stop(sigCh)
+
+	select {
+	case sig := <-sigCh:
+		log.Printf("received signal %s, shutting down", sig)
+		stopBackgroundRescan(stopRescan, &rescanWG)
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := server.Shutdown(ctx); err != nil {
+			log.Printf("graceful shutdown failed: %v", err)
+			if closeErr := server.Close(); closeErr != nil {
+				log.Printf("forced server close failed: %v", closeErr)
+			}
+		}
+		if err := <-serverErr; err != nil && !errors.Is(err, http.ErrServerClosed) {
+			log.Fatal(err)
+		}
+	case err := <-serverErr:
+		stopBackgroundRescan(stopRescan, &rescanWG)
+		if err != nil && !errors.Is(err, http.ErrServerClosed) {
+			log.Fatal(err)
+		}
+	}
+}
+
+func stopBackgroundRescan(stopCh chan struct{}, wg *sync.WaitGroup) {
+	if stopCh == nil {
+		return
+	}
+	close(stopCh)
+	wg.Wait()
+}
+
+func newHTTPServer(addr string, handler http.Handler) *http.Server {
+	return &http.Server{
+		Addr:              addr,
+		Handler:           handler,
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       15 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       60 * time.Second,
 	}
 }
 
