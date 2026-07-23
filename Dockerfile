@@ -17,13 +17,6 @@ RUN apk add --no-cache exiftool libwebp-tools
 
 COPY --from=build /out/photo-gallery /app/photo-gallery
 
-RUN addgroup -S gallery \
-	&& adduser -S -G gallery -h /app gallery \
-	&& mkdir -p /cache/thumbs /photos \
-	&& chown -R gallery:gallery /app /cache
-
-USER gallery:gallery
-
 EXPOSE 8080
 
 ENV ADDR=:8080

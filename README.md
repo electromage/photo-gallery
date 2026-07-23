@@ -65,10 +65,6 @@ The `pg-cache` volume persists the index so restarts don't re-scan everything (s
 [indexing & performance](#indexing--performance)). It's optional — omit it and each
 fresh container just re-indexes from scratch on start.
 
-The container runs as a non-root user. If you bind-mount a host directory for
-`/cache` instead of using a named volume, make sure it is writable by the
-container user.
-
 To update after pulling changes: `docker build -t photo-gallery . && docker rm -f
 photo-gallery` then re-run the command above.
 

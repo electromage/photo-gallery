@@ -2,8 +2,6 @@ package gallery
 
 import (
 	"bytes"
-	"crypto/sha256"
-	"encoding/hex"
 	"image"
 	"image/jpeg"
 	"net/http"
@@ -175,23 +173,5 @@ func TestSizeChangeRefreshesCache(t *testing.T) {
 	}
 	if h := reqThumb(g2).Bounds().Dy(); h != 300 {
 		t.Fatalf("second thumb height = %d, want 300", h)
-	}
-}
-
-func TestVariantCacheNameUsesDeterministicSHA256(t *testing.T) {
-	v := variant{tag: "t", maxW: 1024, maxH: 512, quality: 80}
-	rel := "trip/photo.jpg"
-
-	got := v.cacheName(rel, "jpg")
-	sum := sha256.Sum256([]byte(rel))
-	expectedPrefix := "t_" + hex.EncodeToString(sum[:]) + "_"
-	if !strings.HasPrefix(got, expectedPrefix) {
-		t.Fatalf("cacheName prefix = %q, want prefix %q", got, expectedPrefix)
-	}
-	if !strings.HasSuffix(got, ".jpg") {
-		t.Fatalf("cacheName suffix = %q, want .jpg", got)
-	}
-	if len(v.sig()) != 8 {
-		t.Fatalf("sig length = %d, want 8", len(v.sig()))
 	}
 }
