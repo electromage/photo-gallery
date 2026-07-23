@@ -13,6 +13,9 @@ it builds a public, browsable archive. Meant as an easy way to get off Flickr.
   keyword (most-used first, with a filter box); click one — or a keyword on a photo —
   to show just those photos (`?tag=…`). Folder + keyword + text search combine.
 - **Search** — filter by album name, embedded EXIF/XMP title, and tags/keywords.
+- **Loupe** — in the fullscreen viewer, toggle a 1:1 magnifier (the loupe button or
+  `L`) that follows the cursor and shows full-resolution detail. The original is
+  fetched lazily only while the loupe is on — the main view stays a light preview.
 - **Multi-resolution downloads** — grab any photo at 720p, 1080p, 1440p, 4K, or the
   full-size original — handy for desktop backgrounds. Images are scaled down
   proportionally (never upscaled) and rotated upright using their EXIF orientation.

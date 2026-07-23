@@ -1558,6 +1558,15 @@ const pageTemplate = `<!doctype html>
       transform:translateX(-50%) translateY(20px); transition:opacity .18s ease, transform .18s ease; }
     .toast.show { opacity:1; transform:translateX(-50%) translateY(0); }
 
+    .v-stage.loupe-on { cursor:crosshair; touch-action:none; }
+    .loupe { position:fixed; z-index:65; width:220px; height:220px; border-radius:50%; overflow:hidden;
+      border:2px solid rgba(255,255,255,.75); box-shadow:0 8px 28px rgba(0,0,0,.55);
+      pointer-events:none; background:#000; transform:translate(-50%,-50%); }
+    .loupe[hidden] { display:none; }
+    .loupe canvas { width:100%; height:100%; display:block; }
+    .loupe.loading::after { content:'loading full resolution…'; position:absolute; inset:0; display:grid;
+      place-items:center; text-align:center; padding:0 14px; color:#fff; font-size:.72rem; background:rgba(0,0,0,.45); }
+
     @media (max-width:600px) {
       .grid { padding:4% 4%; }
       .tile { height:200px; }
@@ -1568,7 +1577,7 @@ const pageTemplate = `<!doctype html>
 </head>
 <body>
   <div id="ambient"></div>
-  <svg width="0" height="0" aria-hidden="true" style="position:absolute"><symbol id="ic-dl" viewBox="0 0 24 24"><path d="M12 3v11m0 0l-4-4m4 4l4-4M5 20h14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></symbol><symbol id="ic-info" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9" fill="none" stroke="currentColor" stroke-width="2"/><path d="M12 11v5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><circle cx="12" cy="7.6" r="1.15" fill="currentColor"/></symbol><symbol id="ic-link" viewBox="0 0 24 24"><path d="M9 15l6-6M10.5 6.5l1-1a4 4 0 015.9 5.9l-2 2M13.5 17.5l-1 1a4 4 0 01-5.9-5.9l2-2" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></symbol><symbol id="ic-folder" viewBox="0 0 24 24"><path d="M3 6.5a1.5 1.5 0 011.5-1.5h4l2 2.2h8A1.5 1.5 0 0120 8.7v9.3a1 1 0 01-1 1H4a1 1 0 01-1-1z" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/></symbol></svg>
+  <svg width="0" height="0" aria-hidden="true" style="position:absolute"><symbol id="ic-dl" viewBox="0 0 24 24"><path d="M12 3v11m0 0l-4-4m4 4l4-4M5 20h14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></symbol><symbol id="ic-info" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9" fill="none" stroke="currentColor" stroke-width="2"/><path d="M12 11v5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><circle cx="12" cy="7.6" r="1.15" fill="currentColor"/></symbol><symbol id="ic-link" viewBox="0 0 24 24"><path d="M9 15l6-6M10.5 6.5l1-1a4 4 0 015.9 5.9l-2 2M13.5 17.5l-1 1a4 4 0 01-5.9-5.9l2-2" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></symbol><symbol id="ic-folder" viewBox="0 0 24 24"><path d="M3 6.5a1.5 1.5 0 011.5-1.5h4l2 2.2h8A1.5 1.5 0 0120 8.7v9.3a1 1 0 01-1 1H4a1 1 0 01-1-1z" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/></symbol><symbol id="ic-loupe" viewBox="0 0 24 24"><circle cx="10.5" cy="10.5" r="6.5" fill="none" stroke="currentColor" stroke-width="2"/><path d="M15.5 15.5L21 21" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><path d="M10.5 7.8v5.4M7.8 10.5h5.4" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></symbol></svg>
 
   <header>
     <h1>{{.Title}}</h1>
@@ -1620,6 +1629,7 @@ const pageTemplate = `<!doctype html>
       <div class="v-bar">
         <button class="v-btn" id="v-link" aria-label="Copy link to this photo"><svg class="ic" style="width:20px;height:20px"><use href="#ic-link"></use></svg></button>
         <button class="v-btn" id="v-info-btn" aria-label="Photo info"><svg class="ic" style="width:20px;height:20px"><use href="#ic-info"></use></svg></button>
+        <button class="v-btn" id="v-loupe" aria-label="Loupe — 1:1 zoom"><svg class="ic" style="width:20px;height:20px"><use href="#ic-loupe"></use></svg></button>
         <button class="v-btn" id="v-dl" aria-label="Download"><svg class="ic" style="width:20px;height:20px"><use href="#ic-dl"></use></svg></button>
         <button class="v-btn" id="v-close" aria-label="Close">&times;</button>
       </div>
@@ -1636,6 +1646,7 @@ const pageTemplate = `<!doctype html>
         <div id="v-info-body"></div>
       </div>
     </aside>
+    <div class="loupe" id="loupe" hidden><canvas id="loupe-cv"></canvas></div>
   </div>
 
   <div class="toast" id="toast"></div>
@@ -1655,6 +1666,22 @@ const pageTemplate = `<!doctype html>
     var crumb = document.getElementById('v-crumb');
     var crumbLabel = document.getElementById('v-crumb-label');
     var cur = -1;
+
+    // Loupe: a magnifier that samples the full-resolution original at 1:1 under the
+    // cursor. The viewer image itself stays a lightweight preview; the original is
+    // fetched lazily only while the loupe is on, and cached per photo.
+    var loupe = document.getElementById('loupe');
+    var loupeCv = document.getElementById('loupe-cv');
+    var loupeBtn = document.getElementById('v-loupe');
+    var loupeStage = document.querySelector('.v-stage');
+    var loupeCtx = loupeCv.getContext('2d');
+    var loupeDpr = Math.max(1, Math.min(3, window.devicePixelRatio || 1));
+    loupeCv.width = Math.round(220 * loupeDpr);
+    loupeCv.height = Math.round(220 * loupeDpr);
+    loupeCtx.imageSmoothingEnabled = false;
+    var loupeOn = false;
+    var full = { i: -1, img: null, ready: false }; // full-res original for the current photo
+    var lastPt = null;                              // last cursor position over the image
 
     // Justified rows: pack tiles left-to-right into rows scaled to a target height,
     // so photos keep their native aspect ratio (no cropping) and time reads
@@ -1787,6 +1814,61 @@ const pageTemplate = `<!doctype html>
       if (!vInfo.childNodes.length) vInfo.appendChild(el('p', 'v-sub', 'No metadata available'));
     }
 
+    // loadFull fetches the full-resolution original for photo i (once), so the loupe
+    // has real pixels to magnify. The browser applies EXIF orientation to the decoded
+    // image, matching the server-oriented preview, so loupe coordinates line up.
+    function loadFull(i){
+      if (full.i === i && full.img) return;
+      var im = new Image();
+      full = { i: i, img: im, ready: false };
+      if (loupeOn) loupe.classList.add('loading');
+      im.onload = function(){
+        if (full.img !== im) return;
+        full.ready = true;
+        loupe.classList.remove('loading');
+        if (loupeOn && lastPt) drawLoupe(lastPt.x, lastPt.y);
+      };
+      im.onerror = function(){ if (full.img === im) full.ready = false; };
+      im.src = '/media/' + PHOTOS[i].p;
+    }
+    // contentRect returns the on-screen rectangle actually covered by the image
+    // (object-fit:contain letterboxes it), in viewport coordinates.
+    function contentRect(){
+      var r = vImg.getBoundingClientRect();
+      var nw = vImg.naturalWidth, nh = vImg.naturalHeight;
+      if (!nw || !nh || !r.width || !r.height) return null;
+      var ratio = nw / nh, rw, rh;
+      if (r.width / r.height > ratio){ rh = r.height; rw = rh * ratio; }
+      else { rw = r.width; rh = rw / ratio; }
+      return { left: r.left + (r.width - rw) / 2, top: r.top + (r.height - rh) / 2, w: rw, h: rh };
+    }
+    function drawLoupe(x, y){
+      if (!loupeOn) return;
+      var cr = contentRect();
+      if (!cr){ loupe.hidden = true; return; }
+      var u = (x - cr.left) / cr.w, v = (y - cr.top) / cr.h;
+      if (u < 0 || u > 1 || v < 0 || v > 1){ loupe.hidden = true; return; } // over letterbox
+      loupe.hidden = false;
+      loupe.style.left = x + 'px';
+      loupe.style.top = y + 'px';
+      if (!full.ready || !full.img){ loupe.classList.add('loading'); loupeCtx.clearRect(0, 0, loupeCv.width, loupeCv.height); return; }
+      loupe.classList.remove('loading');
+      var fw = full.img.naturalWidth, fh = full.img.naturalHeight;
+      var win = loupeCv.width, half = win / 2;                     // window == canvas backing => 1 image px : 1 device px
+      var sx = Math.max(half, Math.min(fw - half, u * fw));
+      var sy = Math.max(half, Math.min(fh - half, v * fh));
+      loupeCtx.clearRect(0, 0, win, win);
+      loupeCtx.drawImage(full.img, sx - half, sy - half, win, win, 0, 0, win, win);
+    }
+    function moveLoupe(e){ if (!loupeOn) return; lastPt = { x: e.clientX, y: e.clientY }; drawLoupe(e.clientX, e.clientY); }
+    function setLoupe(on){
+      loupeOn = on;
+      loupeBtn.classList.toggle('on', on);
+      loupeStage.classList.toggle('loupe-on', on);
+      if (on){ loadFull(cur); }
+      else { loupe.hidden = true; loupe.classList.remove('loading'); lastPt = null; }
+    }
+
     function openMenu(i, x, y){
       menu.innerHTML = '';
       RES.concat(['original']).forEach(function(r){
@@ -1828,6 +1910,8 @@ const pageTemplate = `<!doctype html>
       if (thumbs[i]) thumbs[i].scrollIntoView({ inline: 'center', block: 'nearest' });
       renderInfo(PHOTOS[i]);
       closeMenu();
+      loupe.hidden = true;                 // hide until the pointer moves over the new image
+      if (loupeOn) loadFull(i);            // preload this photo's original at full resolution
       if (!viewer.hidden) history.replaceState({ v: 1, i: i }, '', urlWithPhoto(i));
     }
     function openViewer(i, viaHistory){
@@ -1838,7 +1922,7 @@ const pageTemplate = `<!doctype html>
     }
     function closeViewer(viaHistory){
       if (viewer.hidden) return;
-      viewer.hidden = true; document.body.style.overflow = ''; vImg.src = ''; closeMenu(); setInfo(false);
+      viewer.hidden = true; document.body.style.overflow = ''; vImg.src = ''; closeMenu(); setInfo(false); loupe.hidden = true;
       if (viaHistory) return;
       if (viewerPushed) { viewerPushed = false; history.back(); }
       else history.replaceState({ v: 0 }, '', urlBase());
@@ -1870,6 +1954,11 @@ const pageTemplate = `<!doctype html>
     document.getElementById('v-prev').onclick = function(e){ e.stopPropagation(); prev(); };
     document.getElementById('v-next').onclick = function(e){ e.stopPropagation(); next(); };
     document.getElementById('v-dl').onclick = function(e){ e.stopPropagation(); var r = this.getBoundingClientRect(); openMenu(cur, r.right - 132, r.bottom + 6); };
+    loupeBtn.onclick = function(e){ e.stopPropagation(); setLoupe(!loupeOn); };
+    loupeStage.addEventListener('pointermove', moveLoupe);
+    loupeStage.addEventListener('pointerdown', function(e){ if (loupeOn && e.pointerType !== 'mouse') moveLoupe(e); });
+    loupeStage.addEventListener('pointerleave', function(){ if (loupeOn) loupe.hidden = true; });
+    loupeStage.addEventListener('pointerup', function(e){ if (loupeOn && e.pointerType !== 'mouse') loupe.hidden = true; });
     strip.addEventListener('click', function(e){ var t = e.target.closest('.fs-thumb'); if (t) go(+t.dataset.i); });
 
     document.addEventListener('click', function(e){
@@ -1885,12 +1974,14 @@ const pageTemplate = `<!doctype html>
       else if (e.key === 'Home') go(0);
       else if (e.key === 'End') go(PHOTOS.length - 1);
       else if (e.key === 'i' || e.key === 'I') toggleInfo();
+      else if (e.key === 'l' || e.key === 'L') setLoupe(!loupeOn);
     });
 
     var stage = document.querySelector('.v-stage');
     var tx = 0;
     stage.addEventListener('touchstart', function(e){ tx = e.changedTouches[0].clientX; }, { passive: true });
     stage.addEventListener('touchend', function(e){
+      if (loupeOn) return; // while the loupe is on, touch-drag drives it instead of paging
       var dx = e.changedTouches[0].clientX - tx;
       if (Math.abs(dx) > 40) { if (dx < 0) next(); else prev(); }
     }, { passive: true });
