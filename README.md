@@ -114,6 +114,83 @@ PHOTO_ROOT=/path/to/your/photos ./photo-gallery
 
 ---
 
+## Running as a systemd service
+
+To run the app as a background service that starts on boot and restarts on failure,
+use the unit provided at [`deploy/photo-gallery.service`](deploy/photo-gallery.service).
+This works well directly on a host or inside an LXD/LXC container (e.g. under Proxmox).
+
+**1. Build and install the binary.** It's a single static binary — build it anywhere
+with Go and copy it to the server, or build on the server itself:
+
+```bash
+go build -o photo-gallery .
+sudo install -m 0755 photo-gallery /usr/local/bin/photo-gallery
+```
+
+**2. (Recommended) install the optional tools** for full metadata and smaller images:
+
+```bash
+sudo apt install libimage-exiftool-perl webp   # Debian/Ubuntu
+```
+
+**3. Install the unit and set your options.** Copy it into place and edit at least
+`PHOTO_ROOT` (and `SITE_TITLE`):
+
+```bash
+sudo cp deploy/photo-gallery.service /etc/systemd/system/
+sudo systemctl edit --full photo-gallery      # adjust PHOTO_ROOT, SITE_TITLE, etc.
+```
+
+The unit runs under `DynamicUser=yes` with a private `StateDirectory`, so the index
+and thumbnail caches persist across restarts at `/var/lib/photo-gallery` (owned by
+the transient service user — no account to create or manage). If you prefer to keep
+settings out of the unit file, drop them in an env file and reference it instead:
+
+```ini
+# /etc/photo-gallery.env
+PHOTO_ROOT=/srv/photos
+SITE_TITLE=My Photo Gallery
+RENDER_CONCURRENCY=4
+```
+```ini
+# in the [Service] section of the unit (replaces the inline Environment= lines)
+EnvironmentFile=/etc/photo-gallery.env
+```
+
+**4. Make the photos readable by the service user.** Because `DynamicUser` runs as a
+transient unprivileged user, your library must be world-readable (or group-readable
+to a group the service is granted). The simplest approach:
+
+```bash
+sudo chmod -R a+rX /srv/photos      # directories traversable, files readable
+```
+
+**5. Enable and start it, then check the logs:**
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now photo-gallery
+journalctl -u photo-gallery -f      # watch it index; each pass logs a summary
+```
+
+Open `http://<server>:8080`. Adding or removing photos is picked up automatically on
+the next rescan (`GALLERY_REFRESH`, default 2 minutes) — no restart needed.
+
+> **Note on large libraries.** On memory-constrained instances, set
+> `RENDER_CONCURRENCY` (see [Configuration](#configuration)) to bound peak memory, and
+> consider `WARM_CACHE=true` so thumbnails are generated in the background rather than
+> on demand. The first warm pass can run for a while; watch it in the journal.
+
+> **Note on hardened containers.** The unit enables systemd sandboxing
+> (`ProtectSystem`, `RestrictNamespaces`, `MemoryDenyWriteExecute`, etc.). Inside an
+> *unprivileged* LXD/LXC container these can fail with a namespace or mount error at
+> startup — if `journalctl -u photo-gallery` shows that, comment out the hardening
+> block in the unit and reload. On a normal host or a privileged container they work
+> as-is.
+
+---
+
 ## How it works
 
 - Put your photos in the photo root, organized into sub-directories. Each directory

@@ -13,16 +13,29 @@ Environment=PHOTO_ROOT=/srv/photos
 Environment=ADDR=:8080
 Environment=GALLERY_CACHE=/var/lib/photo-gallery/index.gob
 Environment=THUMB_CACHE=/var/lib/photo-gallery/thumbs
-Environment=SITE_TITLE=My Photo Gallery
+# Values with spaces must be quoted, or systemd splits them into broken assignments.
+Environment="SITE_TITLE=My Photo Gallery"
 # Public URL; enables shareable link previews (Open Graph). Leave unset if none.
 #Environment=SITE_DOMAIN=https://photos.example.com
 # Alternatively keep settings in a file: EnvironmentFile=/etc/photo-gallery.env
 # How often to pick up added/removed photos (Go duration, e.g. 30s, 5m; 0 disables).
 #Environment=GALLERY_REFRESH=2m
+# Max concurrent full-resolution image decodes. Bounds peak memory on constrained
+# instances (each decode of a large photo can use a few hundred MB); default = CPU
+# count. Lower it if the service gets OOM-killed. See MemoryMax below to enforce a cap.
+#Environment=RENDER_CONCURRENCY=4
+# Pre-generate thumbnails/previews in the background after indexing (first pass runs
+# a while; watch the journal) instead of lazily on first view.
+#Environment=WARM_CACHE=true
 
 ExecStart=/usr/local/bin/photo-gallery
 Restart=on-failure
 RestartSec=2
+
+# Optional cgroup memory cap as a backstop (systemd restarts the service if it's hit
+# rather than letting the kernel OOM-killer act unpredictably). Pair with a matching
+# RENDER_CONCURRENCY above. Uncomment and size to your instance.
+#MemoryMax=2G
 
 # Run as an auto-provisioned, unprivileged user with a private state directory
 # at /var/lib/photo-gallery, where the index cache lives.
