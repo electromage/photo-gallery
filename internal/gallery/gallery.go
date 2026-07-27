@@ -58,6 +58,13 @@ type Config struct {
 	PreviewMax     int            // preview max longest edge in px (0 = default)
 	PreviewQuality int            // preview JPEG/WebP quality 1-100 (0 = default)
 	DownloadSizes  []DownloadSize // download resolution presets (nil = default)
+
+	// RenderConcurrency caps how many full-resolution image decodes run at once
+	// across on-demand serving, warming, and downloads. Each decode of a large
+	// photo transiently allocates a lot (a rotated 24MP shot needs ~200 MB), so an
+	// unbounded count under load can exhaust memory and get the process OOM-killed.
+	// 0 uses the default (number of CPUs).
+	RenderConcurrency int
 }
 
 type Gallery struct {
@@ -83,6 +90,24 @@ type Gallery struct {
 
 	rescanMu sync.Mutex // serializes rescans so overlapping ticks are skipped
 	warmMu   sync.Mutex // ensures only one cache-warm pass runs at a time
+
+	// renderSem bounds concurrent full-image decodes (thumbnails, previews,
+	// downloads, warming) so peak memory stays under control regardless of load.
+	renderSem chan struct{}
+}
+
+// acquireRender blocks until a render slot is free; releaseRender returns it. Both
+// are no-ops when the limiter is unset (e.g. a zero-value Gallery in a test).
+func (g *Gallery) acquireRender() {
+	if g.renderSem != nil {
+		g.renderSem <- struct{}{}
+	}
+}
+
+func (g *Gallery) releaseRender() {
+	if g.renderSem != nil {
+		<-g.renderSem
+	}
 }
 
 // cacheEntry remembers a processed photo along with the file stats used to decide
@@ -286,6 +311,7 @@ func New(cfg Config) (*Gallery, error) {
 			quality: clampQuality(cfg.PreviewQuality, defaultPreviewQuality),
 		},
 		downloadSizes: downloadSizes,
+		renderSem:     make(chan struct{}, positiveOr(cfg.RenderConcurrency, runtime.NumCPU())),
 	}
 	// exiftool gives the most accurate metadata (including Nikon/Canon maker-note
 	// details like lens names) across camera makes and edited/exported files. If the

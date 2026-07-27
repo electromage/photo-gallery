@@ -17,6 +17,15 @@ RUN apk add --no-cache exiftool libwebp-tools
 
 COPY --from=build /out/photo-gallery /app/photo-gallery
 
+# Run as an unprivileged user. Pre-create the cache/photo mount points owned by
+# that user so a fresh named volume (or the ephemeral layer) is writable.
+RUN addgroup -S gallery \
+	&& adduser -S -G gallery -h /app gallery \
+	&& mkdir -p /cache/thumbs /photos \
+	&& chown -R gallery:gallery /app /cache
+
+USER gallery:gallery
+
 EXPOSE 8080
 
 ENV ADDR=:8080

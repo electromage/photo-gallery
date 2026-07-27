@@ -2,7 +2,7 @@ package gallery
 
 import (
 	"bytes"
-	"crypto/sha1"
+	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
 	"image"
@@ -58,7 +58,7 @@ func positiveOr(v, def int) int {
 }
 
 func (v variant) cacheName(relSlash, ext string) string {
-	sum := sha1.Sum([]byte(relSlash))
+	sum := sha256.Sum256([]byte(relSlash))
 	return v.tag + "_" + hex.EncodeToString(sum[:]) + "_" + v.sig() + "." + ext
 }
 
@@ -66,7 +66,7 @@ func (v variant) cacheName(relSlash, ext string) string {
 // filenames so that changing the size or quality invalidates old renditions (a
 // changed sig produces a new filename, missing the cache).
 func (v variant) sig() string {
-	sum := sha1.Sum([]byte(fmt.Sprintf("%d:%d:%d", v.maxW, v.maxH, v.quality)))
+	sum := sha256.Sum256([]byte(fmt.Sprintf("%d:%d:%d", v.maxW, v.maxH, v.quality)))
 	return hex.EncodeToString(sum[:4])
 }
 
@@ -152,12 +152,18 @@ func (g *Gallery) serveVariant(w http.ResponseWriter, r *http.Request, prefix st
 		}
 	}
 
+	// Bound concurrent decodes: a large original balloons in memory while decoded
+	// and resized, so hold a render slot for that work (released before we write
+	// the response, which needs no slot).
+	g.acquireRender()
 	img, err := loadImageOriented(abs, g.photoOrient(relSlash))
 	if err != nil {
+		g.releaseRender()
 		http.Error(w, "could not read image", http.StatusInternalServerError)
 		return
 	}
 	data, ext, err := g.encodeImage(fitInside(img, v.maxW, v.maxH), v.quality)
+	g.releaseRender()
 	if err != nil {
 		http.Error(w, "could not render image", http.StatusInternalServerError)
 		return

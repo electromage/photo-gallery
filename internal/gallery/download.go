@@ -108,13 +108,17 @@ func (g *Gallery) HandleDownload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Bound concurrent decodes (see serveVariant): downloads decode the full-size
+	// original, which is the most memory-hungry path of all.
+	g.acquireRender()
 	img, err := loadImageOriented(absPath, g.photoOrient(relSlash))
 	if err != nil {
+		g.releaseRender()
 		http.Error(w, "could not read image", http.StatusInternalServerError)
 		return
 	}
-
 	resized := fitInside(img, size.Width, size.Height)
+	g.releaseRender()
 
 	stem := strings.TrimSuffix(baseName, filepath.Ext(baseName))
 	downloadName := fmt.Sprintf("%s-%s.jpg", stem, size.Label)

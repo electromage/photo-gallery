@@ -30,12 +30,21 @@ func (g *Gallery) warmCache() {
 		return
 	}
 
+	// Keep the warm pass modest and, crucially, below the render limit so live
+	// requests always have a free render slot (the shared limiter caps total
+	// memory; this just stops warming from monopolizing it).
 	workers := runtime.NumCPU() / 2
 	if workers < 1 {
 		workers = 1
 	}
-	if workers > 4 {
-		workers = 4 // leave headroom for serving requests
+	if workers > 2 {
+		workers = 2
+	}
+	if sc := cap(g.renderSem); sc > 0 && workers >= sc {
+		workers = sc - 1
+		if workers < 1 {
+			workers = 1
+		}
 	}
 
 	start := time.Now()
@@ -88,6 +97,11 @@ func (g *Gallery) warmPhoto(p Photo) int {
 	if len(missing) == 0 {
 		return 0
 	}
+
+	// Share the render limiter with live requests so warming can never push the
+	// total number of in-flight decodes past the memory ceiling.
+	g.acquireRender()
+	defer g.releaseRender()
 
 	img, err := loadImageOriented(abs, p.Orient) // single decode for all missing variants
 	if err != nil {

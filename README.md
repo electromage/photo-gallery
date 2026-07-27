@@ -65,6 +65,10 @@ The `pg-cache` volume persists the index so restarts don't re-scan everything (s
 [indexing & performance](#indexing--performance)). It's optional — omit it and each
 fresh container just re-indexes from scratch on start.
 
+The container runs as an unprivileged user. If you bind-mount a host directory for
+`/cache` instead of using a named volume, make sure it is writable by the container
+user (or run with `--user "$(id -u):$(id -g)"` to match your host account).
+
 To update after pulling changes: `docker build -t photo-gallery . && docker rm -f
 photo-gallery` then re-run the command above.
 
@@ -165,6 +169,12 @@ Designed to handle large libraries (tens of thousands of photos):
   browse is instant too. Budget roughly a few hundred MB–several GB of disk for a
   large library, and expect the warm pass to run for a while in the background on
   first start (it's incremental — later runs only handle new photos).
+- **Bounded memory.** Decoding a full-resolution photo transiently needs a lot of
+  RAM (a rotated 24MP shot ≈ 200 MB while it's resized), so `RENDER_CONCURRENCY`
+  caps how many decodes run at once — across on-demand serving, downloads, **and**
+  warming combined. This keeps a burst of scrolling (or the warm pass) from
+  exhausting memory and getting the process OOM-killed. It defaults to the CPU
+  count; lower it on small instances, raise it for throughput on large ones.
 
 Each index pass logs a one-line summary, e.g.
 `indexed 16000 photos in 42 albums (120 new/changed, 15880 reused) in 180ms`.
@@ -186,6 +196,7 @@ layer. Point elsewhere with `GALLERY_ENV_FILE=/path/to/file`.
 | `GALLERY_CACHE` | `gallery-cache.gob` | Path to the persisted index cache (`/cache/index.gob` in the Docker image). Set empty to disable persistence |
 | `THUMB_CACHE` | `gallery-thumbs` | Directory for generated thumbnails and previews (`/cache/thumbs` in the Docker image). Set empty to generate them on the fly without caching |
 | `WARM_CACHE` | `false` | Pre-generate all thumbnails/previews in the background after indexing, so the first browse is instant (costs CPU + disk up front — see below) |
+| `RENDER_CONCURRENCY` | _(CPU count)_ | Max full-resolution image decodes running at once (thumbnails, previews, downloads, warming combined). Bounds peak memory — lower it if the process is OOM-killed on a small instance; raise it for throughput on a big one |
 | `THUMB_HEIGHT` | `512` | Thumbnail max height in px (grid + filmstrip) |
 | `THUMB_QUALITY` | `82` | Thumbnail JPEG/WebP quality (1–100) |
 | `PREVIEW_MAX` | `2048` | Preview max longest edge in px (fullscreen viewer image) |

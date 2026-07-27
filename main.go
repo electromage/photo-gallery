@@ -2,11 +2,16 @@ package main
 
 import (
 	"bufio"
+	"context"
+	"errors"
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
 	"strconv"
 	"strings"
+	"sync"
+	"syscall"
 	"time"
 
 	"github.com/electromage/photo-gallery/internal/gallery"
@@ -30,29 +35,44 @@ func main() {
 	}
 
 	app, err := gallery.New(gallery.Config{
-		PhotoRoot:      photoRoot,
-		CachePath:      cachePath,
-		ThumbCache:     thumbCache,
-		WarmCache:      boolEnv("WARM_CACHE", false),
-		Title:          getenv("SITE_TITLE", "Photo Gallery"),
-		Domain:         getenv("SITE_DOMAIN", ""),
-		ThumbHeight:    intEnv("THUMB_HEIGHT", 0),
-		ThumbQuality:   intEnv("THUMB_QUALITY", 0),
-		PreviewMax:     intEnv("PREVIEW_MAX", 0),
-		PreviewQuality: intEnv("PREVIEW_QUALITY", 0),
-		DownloadSizes:  downloadSizes,
+		PhotoRoot:         photoRoot,
+		CachePath:         cachePath,
+		ThumbCache:        thumbCache,
+		WarmCache:         boolEnv("WARM_CACHE", false),
+		Title:             getenv("SITE_TITLE", "Photo Gallery"),
+		Domain:            getenv("SITE_DOMAIN", ""),
+		ThumbHeight:       intEnv("THUMB_HEIGHT", 0),
+		ThumbQuality:      intEnv("THUMB_QUALITY", 0),
+		PreviewMax:        intEnv("PREVIEW_MAX", 0),
+		PreviewQuality:    intEnv("PREVIEW_QUALITY", 0),
+		DownloadSizes:     downloadSizes,
+		RenderConcurrency: intEnv("RENDER_CONCURRENCY", 0),
 	})
 	if err != nil {
 		log.Fatalf("unable to index photos: %v", err)
 	}
 
+	// The rescan goroutine is stoppable so a graceful shutdown can wind it down
+	// cleanly instead of leaving it running as the process exits.
+	var (
+		rescanWG   sync.WaitGroup
+		stopRescan chan struct{}
+	)
 	if refreshInterval > 0 {
+		stopRescan = make(chan struct{})
+		rescanWG.Add(1)
 		go func() {
+			defer rescanWG.Done()
 			ticker := time.NewTicker(refreshInterval)
 			defer ticker.Stop()
-			for range ticker.C {
-				if err := app.Rescan(); err != nil {
-					log.Printf("background rescan failed: %v", err)
+			for {
+				select {
+				case <-ticker.C:
+					if err := app.Rescan(); err != nil {
+						log.Printf("background rescan failed: %v", err)
+					}
+				case <-stopRescan:
+					return
 				}
 			}
 		}()
@@ -70,9 +90,64 @@ func main() {
 	})
 	mux.HandleFunc("/", app.HandleIndex)
 
-	log.Printf("photo gallery listening on %s and serving %s", addr, photoRoot)
-	if err := http.ListenAndServe(addr, mux); err != nil {
-		log.Fatal(err)
+	server := newHTTPServer(addr, mux)
+	serverErr := make(chan error, 1)
+	go func() {
+		log.Printf("photo gallery listening on %s and serving %s", addr, photoRoot)
+		serverErr <- server.ListenAndServe()
+	}()
+
+	// Shut down cleanly on SIGINT/SIGTERM: stop accepting, let in-flight requests
+	// drain (up to 10s), and stop the background rescan before exiting.
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+	defer signal.Stop(sigCh)
+
+	select {
+	case sig := <-sigCh:
+		log.Printf("received signal %s, shutting down", sig)
+		stopBackgroundRescan(stopRescan, &rescanWG)
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := server.Shutdown(ctx); err != nil {
+			log.Printf("graceful shutdown failed: %v", err)
+			if closeErr := server.Close(); closeErr != nil {
+				log.Printf("forced server close failed: %v", closeErr)
+			}
+		}
+		if err := <-serverErr; err != nil && !errors.Is(err, http.ErrServerClosed) {
+			log.Fatal(err)
+		}
+	case err := <-serverErr:
+		stopBackgroundRescan(stopRescan, &rescanWG)
+		if err != nil && !errors.Is(err, http.ErrServerClosed) {
+			log.Fatal(err)
+		}
+	}
+}
+
+// stopBackgroundRescan signals the rescan goroutine to stop and waits for it.
+func stopBackgroundRescan(stopCh chan struct{}, wg *sync.WaitGroup) {
+	if stopCh == nil {
+		return
+	}
+	close(stopCh)
+	wg.Wait()
+}
+
+// newHTTPServer builds the HTTP server with hardening timeouts. ReadHeaderTimeout
+// and ReadTimeout bound how long a slow client can tie up a connection while
+// sending a request (slowloris protection); IdleTimeout caps keep-alive idle time.
+// There is deliberately no WriteTimeout: responses include on-demand image
+// generation and multi-megabyte original downloads that can legitimately run longer
+// than any fixed write deadline, which would otherwise truncate them mid-transfer.
+func newHTTPServer(addr string, handler http.Handler) *http.Server {
+	return &http.Server{
+		Addr:              addr,
+		Handler:           handler,
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       15 * time.Second,
+		IdleTimeout:       60 * time.Second,
 	}
 }
 
